@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cu116
+torch==1.12.1+cu116
+torchaudio==0.12.1+cu116
+torchvision==0.13.1+cu116
+plyfile==0.8.1
+numpy==1.26
+trimesh
+omegaconf
+kiui
+scipy
+opencv-python
+imageio-ffmpeg
+huggingface_hub
+tqdm
+mpi4py
+imageio
+tensorboard
+transformers
+lazy_loader
+# git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git

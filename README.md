@@ -24,8 +24,10 @@ We recommend Linux for performance and compatibility reasons. We use conda to ma
 ```
 git clone https://github.com/GaussianCube/GaussianCube.git
 cd GaussianCube
-conda env create -f environment.yml
+conda create -n gaussiancube python=3.9 -y
 conda activate gaussiancube
+pip install -r requirements.txt
+pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
 ```
 
 ## Model Download
