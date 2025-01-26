@@ -17,4 +17,7 @@ imageio
 tensorboard
 transformers
 lazy_loader
+matplotlib
+nuscenes-devkit
+gsplat
 # git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
