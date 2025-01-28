@@ -35,9 +35,9 @@ def main():
     first_sample_token = scene['first_sample_token']
     sample = nusc.get('sample', first_sample_token)
     t = 0
-    os.makedirs("videos/gt_images", exist_ok=True)
+    os.makedirs(f"videos/{args.scene_idx}/gt_images", exist_ok=True)
     while sample:
-        save_img(nusc, sample, f"videos/gt_images/frame_{t:04d}.png")
+        save_img(nusc, sample, f"videos/{args.scene_idx}/gt_images/frame_{t:04d}.png")
 
         # Move to the next sample
         if sample['next'] == '':
@@ -46,8 +46,8 @@ def main():
         t += 1
 
     # Generate a video from the saved frames
-    frame_paths = sorted(glob.glob("videos/gt_images/frame_*.png"))
-    with imageio.get_writer('videos/gt_video.mp4', fps=2) as video_writer:
+    frame_paths = sorted(glob.glob(f"videos/{args.scene_idx}/gt_images/frame_*.png"))
+    with imageio.get_writer(f'videos/{args.scene_idx}/gt_video.mp4', fps=2) as video_writer:
         for frame_path in frame_paths:
             frame = imageio.imread(frame_path)
             video_writer.append_data(frame)
@@ -55,7 +55,7 @@ def main():
     # Clean up the frame images and remove the folder
     for frame_path in frame_paths:
         os.remove(frame_path)
-    os.rmdir("videos/gt_images")
+    os.rmdir(f"videos/{args.scene_idx}/gt_images")
 
 if __name__ == "__main__":
     main()

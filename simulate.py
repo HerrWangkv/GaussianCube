@@ -258,9 +258,10 @@ class Car(Object3D):
     
     def centerlize_and_scale_initial_gs(self):
         # self._initial_gs = self.rotate_gs(rpy2rotations(0, 0, -np.pi/2), self._initial_gs)
-        x_min, x_max = self._initial_gs['xyz'][:, 0].topk(10, largest=False).values.median(), self._initial_gs['xyz'][:, 0].topk(10).values.median()
-        y_min, y_max = self._initial_gs['xyz'][:, 1].topk(10, largest=False).values.median(), self._initial_gs['xyz'][:, 1].topk(10).values.median()
-        z_min, z_max = self._initial_gs['xyz'][:, 2].topk(10, largest=False).values.median(), self._initial_gs['xyz'][:, 2].topk(10).values.median()
+        valid_mask = self._initial_gs['opacities'].squeeze()!=0
+        x_min, x_max = self._initial_gs['xyz'][valid_mask, 0].min(), self._initial_gs['xyz'][valid_mask, 0].max()
+        y_min, y_max = self._initial_gs['xyz'][valid_mask, 1].min(), self._initial_gs['xyz'][valid_mask, 1].max()
+        z_min, z_max = self._initial_gs['xyz'][valid_mask, 2].min(), self._initial_gs['xyz'][valid_mask, 2].max()
         center = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]).cuda()
         self._initial_gs['xyz'] -= center
         initial_size = torch.tensor([x_max - x_min, y_max - y_min, z_max - z_min]).cuda()
@@ -404,13 +405,13 @@ def main():
                     gs[key] = torch.vstack([gs[key], obj_gs[key]])
 
         # Save the rendered image for the current frame
-        os.makedirs("videos/rendered_images", exist_ok=True)
-        image_path = f"videos/rendered_images/frame_{t:04d}.png"
+        os.makedirs(f"videos/{args.scene_idx}/rendered_images", exist_ok=True)
+        image_path = f"videos/{args.scene_idx}/rendered_images/frame_{t:04d}.png"
         render(gs, intrinsics, extrinsics, save_path=image_path)
 
     # Generate a video from the saved frames
-    frame_paths = sorted(glob.glob("videos/rendered_images/frame_*.png"))
-    with imageio.get_writer('videos/rendered_video.mp4', fps=2) as video_writer:
+    frame_paths = sorted(glob.glob(f"videos/{args.scene_idx}/rendered_images/frame_*.png"))
+    with imageio.get_writer(f'videos/{args.scene_idx}/rendered_video.mp4', fps=2) as video_writer:
         for frame_path in frame_paths:
             frame = imageio.imread(frame_path)
             video_writer.append_data(frame)
@@ -418,7 +419,7 @@ def main():
     # Clean up the frame images and remove the folder
     for frame_path in frame_paths:
         os.remove(frame_path)
-    os.rmdir("videos/rendered_images")
+    os.rmdir(f"videos/{args.scene_idx}/rendered_images")
 
 
 if __name__ == "__main__":
