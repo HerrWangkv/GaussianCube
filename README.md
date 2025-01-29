@@ -198,3 +198,8 @@ If you find this work useful, please consider citing:
 - [x] Release all pretrained models.
 - [x] Release the data construction code.
 - [x] Release the diffusion training code.
+
+
+## NuScenes
+- NuScenes
+- NuInsSeg: https://drive.google.com/file/d/1auTrDQoJnIC_qzf_pQ6_e8QygIW0rQ5B/view?usp=sharing
