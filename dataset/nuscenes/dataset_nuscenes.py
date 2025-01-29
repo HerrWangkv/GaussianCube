@@ -1,23 +1,14 @@
-import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import os
 import numpy as np
 from PIL import Image
-import yaml
-from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
-from nuscenes.map_expansion.map_api import NuScenesMap
 from pyquaternion import Quaternion
 import warnings
-from typing import List
-import math
-import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
-from plyfile import PlyData, PlyElement
 import time
 import json
 from tqdm import tqdm
-import argparse
 
 
 from dataset.nuscenes.nuinsseg import NuInsSeg, CAM_SENSOR
@@ -38,7 +29,7 @@ def timer(func):
 ################## Data loader ##################
 #################################################
 
-class NuScenesObjects:
+class NuScenesObjects(Dataset):
     def __init__(self, version, data_root, ins_seg_root, split, verbose=True, min_visibility=4):
         '''
         Args:
@@ -48,6 +39,7 @@ class NuScenesObjects:
             verbose (bool): whether to print information of the dataset
             seqs (list): list of scene indices to load
         '''
+        super().__init__()
         self.version = version
         self.nusc = NuInsSeg(version=version, data_root=data_root, ins_seg_root=ins_seg_root, verbose=verbose) 
         self.split = split
@@ -187,18 +179,18 @@ class NuScenesObjects:
         }
         return ret
     
-    def vis(self, idx):
+    def vis(self, idx, bg_color=(1, 1, 1)):
         data = self.__getitem__(idx)
         print(f"Object category: {data['category']}")
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
         for i, ax in enumerate(axes.flat):
             if cams[i] not in data['imgs']:
-                ax.imshow(np.zeros((900, 1600, 3)))
+                ax.imshow(np.ones((900, 1600, 3)) * np.array(bg_color))
             else:
-                img = data['imgs'][cams[i]]
-                mask = data['masks'][cams[i]]
-                obj_img = img * mask
+                img = data['imgs'][cams[i]] / 255
+                mask = data['masks'][cams[i]].reshape(1, 900, 1600)
+                obj_img = img * mask + (1 - mask) * np.array(bg_color).reshape(3, 1, 1)
                 ax.imshow(obj_img.transpose(1, 2, 0))
             ax.set_title(cams[i])
             ax.axis('off')
@@ -206,6 +198,24 @@ class NuScenesObjects:
         plt.savefig("obj.png", bbox_inches='tight')
         plt.close()
         self.nusc.render_annotation(self.obj_list[idx][0], out_path="gt.png")
+
+def load_data(
+    *,
+    batch_size,
+    data_root,
+    ins_seg_root,
+    deterministic=False,
+    split='train',
+):
+    dataset = NuScenesObjects(version='v1.0-trainval', data_root=data_root, ins_seg_root=ins_seg_root, split=split)
+    if deterministic:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    while True:
+        yield from loader
+    
+    
 
 # nusc = NuScenesObjects(version='v1.0-mini', data_root='/storage_local/kwang/nuscenes/raw', ins_seg_root='/storage_local/kwang/nuscenes/insSeg', split='train')
 # nusc.vis(11)

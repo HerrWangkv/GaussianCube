@@ -305,7 +305,7 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=533, height=300):
         far_plane=10000000000.0,
         render_mode="RGB",
         radius_clip=0.,
-        backgrounds=torch.zeros(1, 3).cuda(),
+        backgrounds=torch.ones(1, 3).cuda(),
     )
     renders = torch.clamp(renders, max=1.0)
     return renders
@@ -315,7 +315,7 @@ def render(gs, intrinsics, extrinsics, save_path='render.png'):
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     for i, ax in enumerate(axes.flat):
         if cams[i] not in intrinsics:
-            ax.imshow(np.zeros((300, 533, 3)))
+            ax.imshow(np.ones((300, 533, 3)))
             ax.set_title(cams[i])
             ax.axis('off')
             continue
