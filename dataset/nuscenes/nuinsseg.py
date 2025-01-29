@@ -66,7 +66,6 @@ class NuInsSeg(NuScenes):
                 mask = instance_rec['instance_mask']
                 mask = [poly for poly in mask if len(poly)!=0]
                 if len(mask) == 0:
-                    masks[cam] = None
                     continue
                 elif isinstance(mask[0], dict):
                     mask = cocomask.decode(mask)
@@ -75,8 +74,6 @@ class NuInsSeg(NuScenes):
                     mask = cocomask.decode(Rs)
                 assert len(mask.shape) == 3
                 masks[cam] = mask[:,:,0]
-            else:
-                masks[cam] = None
         return masks
 
     def render_2d_annotation(self, sample, sample_annotation_token) -> None:
