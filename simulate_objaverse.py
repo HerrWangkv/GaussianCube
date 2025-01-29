@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import contextlib
+import io
 from omegaconf import OmegaConf
 from mpi4py import MPI
 from huggingface_hub import hf_hub_download
@@ -143,32 +145,26 @@ def rpy2rotations(roll, pitch, yaw):
         [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
         [-sp, cp * sr, cp * cr]
     ]).cuda()
-
+    
 class Object3D:
-    def __init__(self, id, size):
+    def __init__(self, id, size, category_name):
         self._id = id
         self._size = torch.tensor(size).cuda()
+        print(f"\tAdd {category_name} {id}")
+        self._text = category_name
         self.generator = torch.Generator(device="cuda").manual_seed(id)
         self.generate_initial_gs()
 
     def generate_initial_gs(self):
-        raise NotImplementedError
-    
-class Car(Object3D):
-    def __init__(self, id, size):
-        print(f"\tAdd Car {id}")
-        super().__init__(id, size)
 
-    def generate_initial_gs(self):
-
-        model_and_diffusion_config = OmegaConf.load("configs/shapenet_uncond.yml")
-        downloaded_files = download_model_files("shapenet_car")
+        model_and_diffusion_config = OmegaConf.load("configs/objaverse_text_cond.yml")
+        downloaded_files = download_model_files("objaverse_v1.1")
 
         ckpt = downloaded_files["ckpt"]
         mean_file = downloaded_files["mean"]
         std_file = downloaded_files["std"]
         bound = downloaded_files["bound"]
-        cond_gen = False
+        cond_gen = text_cond =True
 
         dist_util.setup_dist()
         torch.cuda.set_device(dist_util.dev())
@@ -181,6 +177,10 @@ class Car(Object3D):
         model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         model.to(dist_util.dev())
         model.eval()
+
+        clip_text_encoder = FrozenCLIPEmbedder()
+        clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
+        text_features = clip_text_encoder.encode(self._text)
         noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.from_numpy(diffusion.betas).to(dist_util.dev()))
 
         std_volume = torch.tensor(init_volume_grid(bound=bound, num_pts_each_axis=32)).to(torch.float32).to(dist_util.dev()).contiguous()
@@ -194,6 +194,9 @@ class Car(Object3D):
         sample_shape = (1, model_and_diffusion_config['model']['in_channels'], image_size, image_size, image_size)
 
         condition, unconditional_condition = {}, {}
+        if text_cond:
+            condition['cond_text'] = text_features
+            unconditional_condition['cond_text'] = torch.zeros_like(text_features)
 
         model_fn = model_wrapper(
             model,
@@ -201,7 +204,7 @@ class Car(Object3D):
             model_type=MODEL_TYPES[model_and_diffusion_config['diffusion']['predict_type']],
             model_kwargs={},
             guidance_type='uncond' if not cond_gen else 'classifier-free',
-            guidance_scale=2.0,
+            guidance_scale=3.5,
             condition=None if not cond_gen else condition,
             unconditional_condition=None if not cond_gen else unconditional_condition,
         )
@@ -209,16 +212,16 @@ class Car(Object3D):
 
         with torch.no_grad():
             noise = torch.randn(sample_shape, device=dist_util.dev(), generator=self.generator)
-
-            samples = dpm_solver.sample(
-                x=noise,
-                steps=300,
-                t_start=1.0,
-                t_end=1/1000,
-                order=3 if not cond_gen else 2,
-                skip_type='time_uniform',
-                method='multistep',
-            )
+            with io.StringIO() as buf, contextlib.redirect_stdout(buf):
+                samples = dpm_solver.sample(
+                    x=noise,
+                    steps=100,
+                    t_start=1.0,
+                    t_end=1/1000,
+                    order=3 if not cond_gen else 2,
+                    skip_type='time_uniform',
+                    method='adaptive' if text_cond else 'multistep',
+                )
             samples_denorm = samples * std + mean
         self._initial_gs = parse_volume_data(samples_denorm[0], std_volume, active_sh_degree=0)
         # TODO: Take bounding box as diffusion input
@@ -367,7 +370,7 @@ def main():
     args = parse_args()
     scene = nusc.scene[args.scene_idx]
     sample = None
-    cars = {}
+    objects = {}
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     for t in range(scene['nbr_samples']):
         gs = None
@@ -387,17 +390,15 @@ def main():
         cam_front_to_world = ego_to_world @ cam_front_to_ego
         for i, ann_token in enumerate(sample['anns']):
             ann = nusc.get('sample_annotation', ann_token)
-            if ann['category_name'] != "vehicle.car" and ann['category_name'] != "vehicle.truck" and not ann['category_name'].startswith("vehicle.bus"):
-                continue
             size = ann['size']
             inst_token = ann['instance_token']
-            if inst_token not in cars:
-                car = Car(len(cars), size)
-                cars[inst_token] = car
+            if inst_token not in objects:
+                obj = Object3D(len(objects), size, ann['category_name'])
+                objects[inst_token] = obj
             else:
-                car = cars[inst_token]
+                obj = objects[inst_token]
             obj_to_cam_front = get_obj_to_cam_front(ann["rotation"], ann["translation"], cam_front_to_world)
-            obj_gs = car.transform_gs(obj_to_cam_front)
+            obj_gs = obj.transform_gs(obj_to_cam_front)
             if gs is None:
                 gs = obj_gs
             else:
@@ -411,7 +412,7 @@ def main():
 
     # Generate a video from the saved frames
     frame_paths = sorted(glob.glob(f"videos/{args.scene_idx}/rendered_images/frame_*.png"))
-    with imageio.get_writer(f'videos/{args.scene_idx}/rendered_video.mp4', fps=2) as video_writer:
+    with imageio.get_writer(f'videos/{args.scene_idx}/objaverse.mp4', fps=2) as video_writer:
         for frame_path in frame_paths:
             frame = imageio.imread(frame_path)
             video_writer.append_data(frame)
