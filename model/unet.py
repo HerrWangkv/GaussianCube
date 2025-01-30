@@ -396,6 +396,7 @@ class UNetModel(nn.Module):
         self.out_channels = out_channels
         self.dropout = dropout
         self.unconditional_gen = unconditional_gen
+        self.image_size = image_size
 
         # adapt attention resolutions
         if isinstance(attention_resolutions, str):

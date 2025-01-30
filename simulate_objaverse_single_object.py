@@ -133,6 +133,49 @@ def quat_multiply(quaternion0, quaternion1):
 
     return torch.concat((w, x, y, z), dim=-1)
 
+def rotation_matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Converts a 3x3 rotation matrix to a quaternion.
+
+    Parameters:
+    matrix (torch.Tensor): A 3x3 rotation matrix.
+
+    Returns:
+    torch.Tensor: A quaternion [w, x, y, z].
+    """
+    if matrix.shape != (3, 3):
+        raise ValueError("Input matrix must be 3x3.")
+
+    # Compute the trace of the matrix
+    trace = torch.trace(matrix)
+
+    if trace > 0:
+        S = 2.0 * torch.sqrt(trace + 1.0)
+        w = 0.25 * S
+        x = (matrix[2, 1] - matrix[1, 2]) / S
+        y = (matrix[0, 2] - matrix[2, 0]) / S
+        z = (matrix[1, 0] - matrix[0, 1]) / S
+    elif (matrix[0, 0] > matrix[1, 1]) and (matrix[0, 0] > matrix[2, 2]):
+        S = 2.0 * torch.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])
+        w = (matrix[2, 1] - matrix[1, 2]) / S
+        x = 0.25 * S
+        y = (matrix[0, 1] + matrix[1, 0]) / S
+        z = (matrix[0, 2] + matrix[2, 0]) / S
+    elif matrix[1, 1] > matrix[2, 2]:
+        S = 2.0 * torch.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])
+        w = (matrix[0, 2] - matrix[2, 0]) / S
+        x = (matrix[0, 1] + matrix[1, 0]) / S
+        y = 0.25 * S
+        z = (matrix[1, 2] + matrix[2, 1]) / S
+    else:
+        S = 2.0 * torch.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])
+        w = (matrix[1, 0] - matrix[0, 1]) / S
+        x = (matrix[0, 2] + matrix[2, 0]) / S
+        y = (matrix[1, 2] + matrix[2, 1]) / S
+        z = 0.25 * S
+
+    return torch.tensor([w, x, y, z])
+
 def rpy2rotations(roll, pitch, yaw):
     """
     Convert roll, pitch, yaw to rotation matrix.
@@ -147,11 +190,12 @@ def rpy2rotations(roll, pitch, yaw):
     ]).cuda()
     
 class Object3D:
-    def __init__(self, id, size, category_name):
+    def __init__(self, id, size, category_name, ckpt=None):
         self._id = id
         self._size = torch.tensor(size).cuda()
         print(f"\tAdd {category_name} {id}")
         self._text = category_name
+        self.ckpt = ckpt
         self.generator = torch.Generator(device="cuda").manual_seed(id)
         self.generate_initial_gs()
 
@@ -160,7 +204,7 @@ class Object3D:
         model_and_diffusion_config = OmegaConf.load("configs/objaverse_text_cond.yml")
         downloaded_files = download_model_files("objaverse_v1.1")
 
-        ckpt = downloaded_files["ckpt"]
+        ckpt = downloaded_files["ckpt"] if self.ckpt is None else self.ckpt
         mean_file = downloaded_files["mean"]
         std_file = downloaded_files["std"]
         bound = downloaded_files["bound"]
@@ -243,9 +287,9 @@ class Object3D:
         Args:
             rotation_matrix: 3x3 rotation matrix
         '''
-        rotated_xyz = gs['xyz'].double() @ rotation_matrix.T
+        rotated_xyz = gs['xyz'] @ rotation_matrix.T
         rotated_rotations = F.normalize(quat_multiply(
-            torch.tensor(Quaternion(matrix=rotation_matrix.cpu().numpy()).elements).cuda(),
+            rotation_matrix_to_quaternion(rotation_matrix).cuda(),
             gs['rots'],
         ))
         gs['xyz'] = rotated_xyz.to(torch.float32)
@@ -310,17 +354,17 @@ def render_gaussian(gaussian, extrinsics, intrinsics, width=533, height=300):
     renders = torch.clamp(renders, max=1.0)
     return renders
 
-def render(gs, intrinsics, extrinsics, save_path='render.png'):
+def render(gs, cam, intrinsics, extrinsics, save_path='render.png'):
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
     for i, ax in enumerate(axes.flat):
-        if cams[i] not in intrinsics:
+        if cams[i] != cam:
             ax.imshow(np.ones((300, 533, 3)))
             ax.set_title(cams[i])
             ax.axis('off')
             continue
-        intrinsic = intrinsics[cams[i]]
-        extrinsic = extrinsics[cams[i]]
+        intrinsic = intrinsics
+        extrinsic = extrinsics
         img = render_gaussian(gs, extrinsic, intrinsic)
         ax.imshow(img[0].detach().cpu().numpy())
         ax.set_title(cams[i])
@@ -331,8 +375,9 @@ def render(gs, intrinsics, extrinsics, save_path='render.png'):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render 3D objects in a scene.")
-    parser.add_argument("--scene_idx", type=int, default=0, help="Index of the scene to render.")
-    parser.add_argument("--ann_idx", type=int, default=11, help="Index of the scene to render.")
+    parser.add_argument("--ckpt", default=None, help="Path to the checkpoint file.")
+    parser.add_argument("--scene_idx", '-s', type=int, default=0, help="Index of the scene to render.")
+    parser.add_argument("--ann_idx", '-a', type=int, default=11, help="Index of the scene to render.")
     return parser.parse_args()
 
 def main():
@@ -340,12 +385,12 @@ def main():
     nusc = NuScenesObjects(version='v1.0-mini', data_root='/storage_local/kwang/nuscenes/raw', ins_seg_root='/storage_local/kwang/nuscenes/insSeg', split=[args.scene_idx], verbose=True)
     print("Multiplt GPUs not yet supported...")
     nusc.vis(args.ann_idx)
-    ann = nusc[args.ann_idx]
+    data, render_params = nusc[args.ann_idx]
     
-    obj = Object3D(0, ann['size'], ann['category'])
-    obj_gs = obj.transform_gs(ann['obj_to_cam_front'])
+    obj = Object3D(0, render_params['size'], render_params['category'], args.ckpt)
+    obj_gs = obj.transform_gs(render_params['obj_to_cam_front'])
     # Save the rendered image for the current frame
-    render(obj_gs, ann['intrinsics'], ann['extrinsics'])
+    render(obj_gs, render_params['cam'], render_params['intrinsics'], render_params['extrinsics'])
 
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True

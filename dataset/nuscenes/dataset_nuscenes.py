@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import time
 import json
 from tqdm import tqdm
+import random
 
 
 from dataset.nuscenes.nuinsseg import NuInsSeg, CAM_SENSOR
@@ -102,11 +103,11 @@ class NuScenesObjects(Dataset):
         print(f"Number of objects: {len(self.obj_list)}")
         print("="*6)
 
-    def _summarize_params(self, sample, ann, visible_cams):
-        cam_front_visible = "CAM_FRONT" in visible_cams
-        if not cam_front_visible:
-            visible_cams.append("CAM_FRONT")
-        cam_tokens = {cam: sample['data'][cam] for cam in visible_cams}
+    def _summarize_params(self, sample, ann, visible_cam):
+        cams = [visible_cam]
+        if visible_cam != "CAM_FRONT":
+            cams.append("CAM_FRONT")
+        cam_tokens = {cam: sample['data'][cam] for cam in cams}
         cam_data = {cam: self.nusc.get('sample_data', cam_tokens[cam]) for cam in cam_tokens}
         ego_pose = self.nusc.get('ego_pose', cam_data['CAM_FRONT']['ego_pose_token'])
         cam_calib_tokens = {cam: cam_data[cam]['calibrated_sensor_token'] for cam in cam_tokens}
@@ -137,13 +138,8 @@ class NuScenesObjects(Dataset):
         obj_to_world[:3, :3] = Quaternion(ann['rotation']).rotation_matrix
         obj_to_world[:3, 3] = ann['translation']
         obj_to_cam_front = np.linalg.inv(cam_front_to_world) @ obj_to_world
-        
-        if not cam_front_visible:
-            visible_cams.remove("CAM_FRONT")
-            del intrinsics["CAM_FRONT"]
-            del extrinsics["CAM_FRONT"]
     
-        return intrinsics, extrinsics, obj_to_cam_front 
+        return intrinsics[visible_cam], extrinsics[visible_cam], obj_to_cam_front 
 
     def __len__(self):
         return len(self.obj_list)
@@ -157,39 +153,37 @@ class NuScenesObjects(Dataset):
         masks = self.nusc.get_masks(sample, ann_token)
         visible_cams = [cam for cam, mask in masks.items() if mask is not None]
         assert len(visible_cams) != 0, f"Object {ann_token} not visible"
+        cam = visible_cams[random.randint(0, len(visible_cams) - 1)]
+        mask = masks[cam]
 
-        imgs = {}
-        for cam in visible_cams:
-            img_name = self.nusc.get('sample_data', sample['data'][cam])['filename']
-            img = np.array(Image.open(os.path.join(self.nusc.dataroot, img_name)).convert('RGB')).transpose(2, 0, 1)
-            imgs[cam] = img
+        img_name = self.nusc.get('sample_data', sample['data'][cam])['filename']
+        img = np.array(Image.open(os.path.join(self.nusc.dataroot, img_name)).convert('RGB')).transpose(2, 0, 1)
+        img = img / 255
         
-        intrinsics, extrinsics, obj_to_cam_front = self._summarize_params(sample, ann, visible_cams)
+        intrinsics, extrinsics, obj_to_cam_front = self._summarize_params(sample, ann, cam)
 
-        assert len(imgs) == len(intrinsics) == len(extrinsics), "Inconsistent number of images, intrinsics, and extrinsics"
-
-        ret = {
-            "size": np.array(ann['size']),
+        data = np.concatenate([img, mask[None, :, :]], axis=0, dtype=np.float32)
+        render_params = {
+            "size": np.array(ann['size'], dtype=np.float32),
             "category": ann['category_name'],
-            "masks": masks,
-            "imgs": imgs,
-            "intrinsics": intrinsics,
-            "extrinsics": extrinsics,
-            "obj_to_cam_front": obj_to_cam_front,
+            "cam": cam,
+            "intrinsics": intrinsics.astype(np.float32),
+            "extrinsics": extrinsics.astype(np.float32),
+            "obj_to_cam_front": obj_to_cam_front.astype(np.float32),
         }
-        return ret
+        return data, render_params
     
     def vis(self, idx, bg_color=(1, 1, 1)):
-        data = self.__getitem__(idx)
-        print(f"Object category: {data['category']}")
+        data, render_params = self.__getitem__(idx)
+        print(f"Object category: {render_params['category']}")
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
         for i, ax in enumerate(axes.flat):
-            if cams[i] not in data['imgs']:
+            if cams[i] != render_params['cam']:
                 ax.imshow(np.ones((900, 1600, 3)) * np.array(bg_color))
             else:
-                img = data['imgs'][cams[i]] / 255
-                mask = data['masks'][cams[i]].reshape(1, 900, 1600)
+                img = data[:3]
+                mask = data[-1]
                 obj_img = img * mask + (1 - mask) * np.array(bg_color).reshape(3, 1, 1)
                 ax.imshow(obj_img.transpose(1, 2, 0))
             ax.set_title(cams[i])

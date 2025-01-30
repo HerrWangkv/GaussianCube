@@ -140,6 +140,28 @@ class SpacedDiffusion(gd.GaussianDiffusion):
     ):  # pylint: disable=signature-differs
         return super().training_losses(self._wrap_model(model), *args, **kwargs)
 
+    def model_output(
+        self, model, x_t, t, model_kwargs=None
+    ):
+        """
+        Predict the output of a model from dpm sampled data.
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        assert self.loss_type == gd.LossType.MSE or self.loss_type == gd.LossType.RESCALED_MSE
+        model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+
+        if self.model_var_type in [
+            gd.ModelVarType.LEARNED,
+            gd.ModelVarType.LEARNED_RANGE,
+        ]:
+            B, C = x_t.shape[:2]
+            assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+            model_output, model_var_values = torch.split(model_output, C, dim=1)
+        return {'x_t': x_t, 'model_output': model_output}
+
+
     def _wrap_model(self, model):
         if isinstance(model, _WrappedModel):
             return model
