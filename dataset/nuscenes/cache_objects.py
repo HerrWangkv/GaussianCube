@@ -18,7 +18,7 @@ def main():
         anns = json.load(f)
     print("Organizing annotations...")
     for ann in tqdm(anns):
-        if int(ann['visibility_token']) >= min_visibility and len(ann['instance_mask']) != 0:
+        if int(ann['visibility_token']) >= min_visibility and len(ann['instance_mask']) != 0 and len(ann['instance_mask'][0]) != 0:
             sample_data_token = ann['sample_data_token']
             sample_data = nusc.get('sample_data', sample_data_token)
             sample_token = sample_data['sample_token']
