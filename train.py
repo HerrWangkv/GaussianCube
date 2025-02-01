@@ -658,17 +658,15 @@ class FinetuneLoop:
                 unconditional_condition=unconditional_condition,
             )
             self.dpm_solver = DPM_Solver(model_fn, self.noise_schedule, algorithm_type='dpmsolver++')
-            with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-                samples = self.dpm_solver.sample(
-                    x=noise,
-                    steps=100,
-                    t_start=1.0,
-                    t_end=float(t[0]/self.diffusion.num_timesteps),
-                    order=2,
-                    skip_type='time_uniform',
-                    method='adaptive',
-                )
-            
+            samples = self.dpm_solver.sample(
+                x=noise,
+                steps=100,
+                t_start=1.0,
+                t_end=float(t[0]/self.diffusion.num_timesteps),
+                order=2,
+                skip_type='time_uniform',
+                method='adaptive',
+            )
             text_features[th.rand(len(text_features)) < self.uncond_p] *= 0
             micro_cond = {"cond_text": text_features}
             t = th.expand_copy(t, (samples.shape[0],))
@@ -684,8 +682,8 @@ class FinetuneLoop:
                 res = place_and_render_gs(gs, render_params['size'][b], render_params['obj_to_cam_front'][b], render_params['intrinsics'][b], render_params['extrinsics'][b], self.bg_color[None,:])
                 mask = micro[b][-1][None,:,:]
                 masks.append(mask)
-                pred_imgs.append(mask * res + (1 - mask) * self.bg_color[:,None,None])
-                gt_imgs.append(mask * micro[b][:3] + (1 - mask) * self.bg_color[:,None,None])
+                pred_imgs.append(mask * res + (1 - mask) * micro[b][:3])
+                gt_imgs.append(micro[b][:3])
 
             pred_img = th.stack(pred_imgs, dim=0)
             gt_img = th.stack(gt_imgs, dim=0)
