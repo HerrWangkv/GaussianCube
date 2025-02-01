@@ -474,7 +474,7 @@ class FinetuneLoop:
         self.has_pretrain_weight = has_pretrain_weight
         self.dataset_type = dataset_type
 
-        self.L1loss = th.nn.L1Loss(reduction='none')
+        self.L1loss = th.nn.L1Loss()
         self.render_l1_weight = render_l1_weight
         if use_vgg:
             self.vgg = LPIPS(net_type='vgg').to(dist_util.dev()).eval()
@@ -684,13 +684,13 @@ class FinetuneLoop:
                 res = place_and_render_gs(gs, render_params['size'][b], render_params['obj_to_cam_front'][b], render_params['intrinsics'][b], render_params['extrinsics'][b], self.bg_color[None,:])
                 mask = micro[b][-1][None,:,:]
                 masks.append(mask)
-                pred_imgs.append(res * mask)
-                gt_imgs.append(micro[b][:3] * mask)
+                pred_imgs.append(mask * res + (1 - mask) * self.bg_color[:,None,None])
+                gt_imgs.append(mask * micro[b][:3] + (1 - mask) * self.bg_color[:,None,None])
 
             pred_img = th.stack(pred_imgs, dim=0)
             gt_img = th.stack(gt_imgs, dim=0)
             masks = th.stack(masks, dim=0)
-            pixel_l1_loss = th.mean(self.L1loss(pred_img, gt_img).sum(dim=[1,2,3]) / masks.sum(dim=[1,2,3])) * self.render_l1_weight
+            pixel_l1_loss = self.L1loss(pred_img, gt_img) * self.render_l1_weight
             losses = {}
             losses["pixel_l1_loss"] = th.tensor([pixel_l1_loss])
             loss = pixel_l1_loss
