@@ -20,7 +20,7 @@ mini_anns = []
 for d in anns:
     if d['sample_data_token'] in mini_sample_data_tokens:
         mini_anns.append(d)
-os.mkdir("/storage_local/kwang/nuscenes/insSeg/v1.0-mini")
+os.makedirs("/storage_local/kwang/nuscenes/insSeg/v1.0-mini", exist_ok=True)
 file_path = "/storage_local/kwang/nuscenes/insSeg/v1.0-mini/nuinsseg.json"
 with open(file_path, 'w') as f:
     json.dump(mini_anns, f)
