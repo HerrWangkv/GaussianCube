@@ -203,3 +203,32 @@ If you find this work useful, please consider citing:
 ## NuScenes
 - NuScenes
 - NuInsSeg: https://drive.google.com/file/d/1auTrDQoJnIC_qzf_pQ6_e8QygIW0rQ5B/view?usp=sharing
+
+## Prompts
+- vehicle car
+  - Positive: A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures
+  - Negative: cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels
+- human pedestrian adult with natural skin color
+  - Positive: A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features
+  - Negative: cartoonish, warped features, blurry textures, mannequin-like, robot-like
+- human pedestrian child with natural skin color
+  - Positive: A realistic child pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features
+  - Negative: cartoonish, warped features, blurry textures, mannequin-like, robot-like
+- human construction worker with natural skin color
+  - Positive: A realistic construction worker walking or standing naturally, photorealistic body proportions, natural skin color, wearing detailed safety gear, sharp facial features
+  - Negative: cartoonish, warped features, blurry textures, mannequin-like, robot-like
+- human police officer with natural skin color
+  - Positive: A realistic police officer walking or standing naturally, photorealistic body proportions, natural skin color, wearing detailed police uniform, sharp facial features
+  - Negative: cartoonish, warped features, blurry textures, mannequin-like, robot-like
+- bicycle
+  - Positive: A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration
+  - Negative: unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, single color
+- vehicle bus
+  - Positive: A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures
+  - Negative: cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, single color
+- vehicle motorcycle
+  - Positive: A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures
+  - Negative: cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, single color
+- vehicle truck
+  - Positive: A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures
+  - Negative: cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, single color

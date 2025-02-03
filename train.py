@@ -19,11 +19,12 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
-import io
-import contextlib
 from gsplat.rendering import rasterization
+from kiui.cam import orbit_camera
 
 from utils.script_util import init_volume_grid
+from utils.sd_utils import StableDiffusion
+from dataset.dataset_render import load_cam
 from model.nn import update_ema
 from model.resample import UniformSampler
 from model.clip import FrozenCLIPEmbedder
@@ -417,7 +418,6 @@ class FinetuneLoop:
         self,
         model,
         diffusion,
-        data,
         batch_size,
         microbatch,
         lr,
@@ -442,12 +442,10 @@ class FinetuneLoop:
         bound=0.45,
         has_pretrain_weight=False,
         num_pts_each_axis=32,
-        dataset_type='nuscenes',
     ):
 
         self.model = model
         self.diffusion = diffusion
-        self.data = data
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -472,7 +470,6 @@ class FinetuneLoop:
         self.bg_color = th.tensor([1,1,1]).to(th.float32).to(dist_util.dev()) if white_background else th.tensor([0,0,0]).to(th.float32).to(dist_util.dev())
         self.std_volume = th.tensor(init_volume_grid(bound=bound, num_pts_each_axis=num_pts_each_axis)).to(th.float32).to(dist_util.dev()).contiguous()
         self.has_pretrain_weight = has_pretrain_weight
-        self.dataset_type = dataset_type
 
         self.L1loss = th.nn.L1Loss()
         self.render_l1_weight = render_l1_weight
@@ -557,6 +554,37 @@ class FinetuneLoop:
         if th.cuda.is_available():
             self.clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
         self.noise_schedule = NoiseScheduleVP(schedule='discrete', betas=th.from_numpy(diffusion.betas).to(dist_util.dev()))
+        self.img_refiner = StableDiffusion(device=dist_util.dev(), fp16=False, vram_O=False)
+        self.prompts_3d = {
+            'vehicle.car': "vehicle car",
+            'human.pedestrian.adult': "human pedestrian adult with natural skin color",
+            'human.pedestrian.child': "human pedestrian child with natural skin",
+            'human.pedestrian.construction_worker': "human construction worker with natural skin color",
+            'vehicle.bicycle': "bicycle",
+            'vehicle.bus': "vehicle bus",
+            'vehicle.motorcycle': "vehicle motorcycle",
+            'vehicle.truck': "vehicle truck",
+        }
+        self.pos_prompts_2d = {
+            'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+            'human.pedestrian.adult': "A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features",
+            'human.pedestrian.child': "A realistic child pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features",
+            'human.pedestrian.construction_worker': "A realistic construction worker walking or standing naturally, photorealistic body proportions, natural skin color, wearing detailed safety gear, sharp facial features",
+            'vehicle.bicycle': "A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration",
+            'vehicle.bus': "A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+            'vehicle.motorcycle': "A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures",
+            'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
+        }
+        self.neg_prompts_2d = {
+            'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels",
+            'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
+            'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
+            'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
+            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, single color",
+            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, single color",
+            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, single color",
+            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, single color",
+        }
     def _load_and_sync_parameters(self):
         resume_checkpoint = self.resume_checkpoint
 
@@ -602,9 +630,13 @@ class FinetuneLoop:
         while (
             not self.lr_anneal_steps
             or self.step <= self.lr_anneal_steps
-        ):
-            batch, render_params = next(self.data)
-            self.run_step(batch, render_params)
+        ):  
+            keys = [key for key in self.prompts_3d]
+            keys = np.random.choice(list(self.prompts_3d.keys()), self.batch_size, replace=True)
+            prompts_3d = [self.prompts_3d[key] for key in keys]
+            pos_prompts_2d = [self.pos_prompts_2d[key] for key in keys]
+            neg_prompts_2d = [self.neg_prompts_2d[key] for key in keys]
+            self.run_step(prompts_3d, pos_prompts_2d, neg_prompts_2d)
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step % self.save_interval == 0:
@@ -614,9 +646,9 @@ class FinetuneLoop:
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, render_params):
+    def run_step(self, prompts_3d, pos_prompts_2d, neg_prompts_2d):
         start_time = time.time()
-        self.forward_backward(batch, render_params)
+        self.forward_backward(prompts_3d, pos_prompts_2d, neg_prompts_2d)
         if self.use_fp16:
             self.optimize_fp16()
         else:
@@ -634,18 +666,45 @@ class FinetuneLoop:
             pred_x0 = self.diffusion._predict_xstart_from_eps(output['x_t'], t, output['model_output'])
         return pred_x0
 
-    def forward_backward(self, batch, render_params):
+    def load_random_cams(self, cam_num):
+        azimuth = np.random.uniform(0, 360, cam_num).astype(np.int32)
+        elevation = -30
+        cam_radius = 2.0
+        cams = None
+        convert_mat = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]).astype(np.float32)
+        for i in range(cam_num):
+            cam_poses = orbit_camera(elevation, azimuth[i], radius=cam_radius, opengl=True)
+            cam_poses = convert_mat @ cam_poses
+            cam = load_cam(c2w=cam_poses)
+            if cams is None:
+                for k, v in cam.items():
+                    if not isinstance(v, th.Tensor):
+                        cam[k] = th.tensor([v])
+                    else:
+                        cam[k] = v.unsqueeze(0)
+                cams = cam
+            else:
+                for k, v in cam.items():
+                    if not isinstance(v, th.Tensor):
+                        cam[k] = th.cat([cams[k], th.tensor([v])], dim=0)
+                    else:
+                        cam[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
+        return cams
+    
+    def forward_backward(self, prompts_3d, pos_prompts_2d, neg_prompts_2d):
         zero_grad(self.model_params)
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            text_features = self.clip_text_encoder.encode(render_params['category'])
+        for i in range(0, len(prompts_3d), self.microbatch):
+            text_cond = prompts_3d[i : i + self.microbatch]
+            pos_prompts = pos_prompts_2d[i : i + self.microbatch]
+            neg_prompts = neg_prompts_2d[i : i + self.microbatch]
+            text_features = self.clip_text_encoder.encode(prompts_3d)
             condition = {"cond_text": text_features}
             unconditional_condition = {'cond_text': th.zeros_like(text_features)}
             
             t, _ = self.schedule_sampler.sample(1, dist_util.dev())
             while t == 0:
                 t, _ = self.schedule_sampler.sample(1, dist_util.dev())
-            sample_shape = (micro.shape[0], self.model.in_channels, self.model.image_size, self.model.image_size, self.model.image_size)
+            sample_shape = (len(text_cond), self.model.in_channels, self.model.image_size, self.model.image_size, self.model.image_size)
             noise = th.randn(sample_shape, device=dist_util.dev())
             model_fn = model_wrapper(
                 self.model,
@@ -676,18 +735,17 @@ class FinetuneLoop:
             pred_x0_denorm = None
             pred_x0 = self.get_pred_x0(output, t)
             pred_x0_denorm = pred_x0 * self.std + self.mean
-            pred_imgs, gt_imgs, masks = [], [], []
-            for b in range(micro.shape[0]):
-                gs = parse_volume_data(pred_x0_denorm[b], self.std_volume, self.active_sh_degree)
-                res = place_and_render_gs(gs, render_params['size'][b], render_params['obj_to_cam_front'][b], render_params['intrinsics'][b], render_params['extrinsics'][b], self.bg_color[None,:])
-                mask = micro[b][-1][None,:,:]
-                masks.append(mask)
-                pred_imgs.append(mask * res + (1 - mask) * micro[b][:3])
-                gt_imgs.append(micro[b][:3])
+            cams = self.load_random_cams(len(text_cond))
+            pred_imgs, gt_imgs = [], []
+            for b in range(len(text_cond)):
+                cam = build_single_viewpoint_cam(cams, 0)
+                res = render(cam, pred_x0_denorm[b], self.std_volume, self.bg_color, self.active_sh_degree)
+                pred_imgs.append(res["render"])
+                gt_img = self.img_refiner.refine(pos_prompts[b], neg_prompts[b], res["render"][None,:,:,:]) # TODO:run in parallel
+                gt_imgs.append(gt_img[0])
 
             pred_img = th.stack(pred_imgs, dim=0)
             gt_img = th.stack(gt_imgs, dim=0)
-            masks = th.stack(masks, dim=0)
             pixel_l1_loss = self.L1loss(pred_img, gt_img) * self.render_l1_weight
             losses = {}
             losses["pixel_l1_loss"] = th.tensor([pixel_l1_loss])
@@ -697,7 +755,7 @@ class FinetuneLoop:
                 losses["vgg_loss"] = th.tensor([vgg_loss])
                 loss += vgg_loss
                 
-            if self.step % 100 == 0 and dist.get_rank() == 0:
+            if self.step % 10 == 0 and dist.get_rank() == 0:
                 s_path = os.path.join(logger.get_dir(), 'train_images')
                 os.makedirs(s_path,exist_ok=True)
                 output_image = pred_img[0].clamp(0.0, 1.0)

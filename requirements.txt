@@ -1,9 +1,10 @@
---extra-index-url https://download.pytorch.org/whl/cu116
-torch==1.12.1+cu116
-torchaudio==0.12.1+cu116
-torchvision==0.13.1+cu116
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.0+cu118
+torchaudio==2.1.0+cu118
+torchvision==0.16.0+cu118
 plyfile==0.8.1
 numpy==1.26
+diffusers >= 0.9.0
 trimesh
 omegaconf
 kiui
@@ -15,6 +16,7 @@ tqdm
 mpi4py
 imageio
 tensorboard
+accelerate
 transformers
 lazy_loader
 matplotlib

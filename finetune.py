@@ -87,23 +87,11 @@ def main():
 
     logger.log("creating data loader...")
 
-    if args.nuscenes:
-        dataset_type = "nuscenes"
-        from dataset.nuscenes.dataset_nuscenes import load_data
-
-    data = load_data(
-        batch_size=args.batch_size,
-        data_root=args.data_root,
-        ins_seg_root=args.ins_seg_root,
-        split='train',
-    )
-
     #TODO: manage uncond_p in TrainLoop
     logger.log("training...")
     FinetuneLoop(
         model,
         diffusion,
-        data=data,
         batch_size=args.batch_size,
         microbatch=args.microbatch,
         lr=args.lr,
@@ -124,7 +112,6 @@ def main():
         bound=bound,#args.bound,
         has_pretrain_weight=has_pretrain_weight,
         num_pts_each_axis=args.num_pts_each_axis,
-        dataset_type=dataset_type,
     ).run_loop()
 
  
@@ -155,9 +142,6 @@ def create_argparser():
     parser.add_argument("--render_l1_weight", type=float, default=1.0)
     parser.add_argument("--render_lpips_weight", type=float, default=1.0)
     # Data args
-    parser.add_argument("--data_root", type=str, default="/storage_local/kwang/nuscenes/raw")
-    parser.add_argument("--ins_seg_root", type=str, default="/storage_local/kwang/nuscenes/insSeg")
-    parser.add_argument("--nuscenes", action="store_true")
     parser.add_argument("--num_pts_each_axis", type=int, default=32)
  
     return parser
