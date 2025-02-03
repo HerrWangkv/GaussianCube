@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 from mpi4py import MPI
 from huggingface_hub import hf_hub_download
 
-from model.unet import UNetModel
+from model.unet import ControlledUNetModel, ControlNet, OverallModel
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver
 from utils import dist_util, logger
@@ -190,21 +190,22 @@ def rpy2rotations(roll, pitch, yaw):
     ]).cuda()
     
 class Object3D:
-    def __init__(self, id, size, category_name, ckpt=None):
+    def __init__(self, id, size, category_name, controlnet_ckpt=None):
         self._id = id
         self._size = torch.tensor(size).cuda()
         print(f"\tAdd {category_name} {id}")
         self._text = category_name
-        self.ckpt = ckpt
+        self.controlnet_ckpt = controlnet_ckpt
         self.generator = torch.Generator(device="cuda").manual_seed(id)
         self.generate_initial_gs()
 
     def generate_initial_gs(self):
 
-        model_and_diffusion_config = OmegaConf.load("configs/objaverse_text_cond.yml")
+        model_and_diffusion_config = OmegaConf.load("configs/finetune.yml")
         downloaded_files = download_model_files("objaverse_v1.1")
 
-        ckpt = downloaded_files["ckpt"] if self.ckpt is None else self.ckpt
+        ckpt = downloaded_files["ckpt"]
+        controlnet_ckpt = self.controlnet_ckpt
         mean_file = downloaded_files["mean"]
         std_file = downloaded_files["std"]
         bound = downloaded_files["bound"]
@@ -215,12 +216,21 @@ class Object3D:
         # seed_everything(dist.get_rank())
 
         model_and_diffusion_config['model']['precision'] = "32"
-        model = UNetModel(**model_and_diffusion_config['model'])
+        model_and_diffusion_config['controlnet']['precision'] = "32"
+        model = ControlledUNetModel(**model_and_diffusion_config['model'])
+        controlnet = ControlNet(**model_and_diffusion_config['controlnet'])
 
         diffusion = create_gaussian_diffusion(**model_and_diffusion_config['diffusion'])
         model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        if controlnet_ckpt is not None:
+            controlnet.load_state_dict(torch.load(controlnet_ckpt, map_location="cpu"))
+        else:
+            controlnet.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
+
         model.to(dist_util.dev())
         model.eval()
+        controlnet.to(dist_util.dev())
+        controlnet.eval()
 
         clip_text_encoder = FrozenCLIPEmbedder()
         clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
@@ -241,9 +251,10 @@ class Object3D:
         if text_cond:
             condition['cond_text'] = text_features
             unconditional_condition['cond_text'] = torch.zeros_like(text_features)
-
+        
+        overall_model = OverallModel(model, controlnet)
         model_fn = model_wrapper(
-            model,
+            overall_model,
             noise_schedule,
             model_type=MODEL_TYPES[model_and_diffusion_config['diffusion']['predict_type']],
             model_kwargs={},
@@ -375,9 +386,9 @@ def render(gs, cam, intrinsics, extrinsics, save_path='render.png'):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Render 3D objects in a scene.")
-    parser.add_argument("--ckpt", default=None, help="Path to the checkpoint file.")
-    parser.add_argument("--scene_idx", '-s', type=int, default=0, help="Index of the scene to render.")
-    parser.add_argument("--ann_idx", '-a', type=int, default=11, help="Index of the scene to render.")
+    parser.add_argument("--controlnet_ckpt", "-c", default=None, help="Path to the checkpoint file.")
+    parser.add_argument("--scene_idx", '-s', type=int, default=2, help="Index of the scene to render.")
+    parser.add_argument("--ann_idx", '-a', type=int, default=343, help="Index of the scene to render.")
     return parser.parse_args()
 
 def main():
@@ -387,7 +398,7 @@ def main():
     nusc.vis(args.ann_idx)
     data, render_params = nusc[args.ann_idx]
     
-    obj = Object3D(0, render_params['size'], render_params['category'], args.ckpt)
+    obj = Object3D(0, render_params['size'], render_params['category'], args.controlnet_ckpt)
     obj_gs = obj.transform_gs(render_params['obj_to_cam_front'])
     # Save the rendered image for the current frame
     render(obj_gs, render_params['cam'], render_params['intrinsics'], render_params['extrinsics'])

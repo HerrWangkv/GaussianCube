@@ -582,10 +582,10 @@ class FinetuneLoop:
             'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
             'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
             'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
-            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, single color, unrealistic proportions",
-            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, single color, unrealistic proportions",
-            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, single color, unrealistic proportions",
-            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, single color, unrealistic proportions",
+            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, unrealistic uniform colors, unrealistic proportions",
+            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
+            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, unrealistic uniform colors, unrealistic proportions",
+            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
         }
     def _load_and_sync_parameters(self):
         resume_checkpoint = self.resume_checkpoint

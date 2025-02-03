@@ -151,9 +151,7 @@ class SpacedDiffusion(gd.GaussianDiffusion):
 
         assert self.loss_type == gd.LossType.MSE or self.loss_type == gd.LossType.RESCALED_MSE
         control = controlnet(x_t, self._scale_timesteps(t), **model_kwargs)
-        with torch.no_grad():
-            pretrained_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
-        model_output = model(x_t, self._scale_timesteps(t), control=control, **model_kwargs)
+        model_output, pretrained_output = model(x_t, self._scale_timesteps(t), control=control, output_vanilla=True, **model_kwargs)
 
         if self.model_var_type in [
             gd.ModelVarType.LEARNED,

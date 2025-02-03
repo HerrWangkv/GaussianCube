@@ -706,7 +706,8 @@ class SuperResUNetModel(UNetModel):
         return super().forward(x, timesteps, aug_emb=aug_emb, **kwargs)
 
 class ControlledUNetModel(UNetModel):
-    def forward(self, x, timesteps, cond_text=None, control=None, **kwargs):
+    def forward(self, x, timesteps, cond_text=None, control=None, output_vanilla=False, **kwargs):
+        assert (control is not None) or (control is None and not output_vanilla), 'output_vanilla only valid with control'
         hs = []
         with torch.no_grad():
             input_type = x.dtype
@@ -729,17 +730,28 @@ class ControlledUNetModel(UNetModel):
             h = self.middle_block(h, emb, encoder_out)
 
         if control is not None:
+            if output_vanilla:
+                h_vanilla = torch.tensor(h)
+                hs_vanilla = hs.copy()
             h += control.pop()
-
         for module in self.output_blocks:
             if control is None:
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
+                if output_vanilla:
+                    h_vanilla = torch.cat([h_vanilla, hs_vanilla.pop()], dim=1)
+                    h_vanilla = module(h_vanilla, emb, encoder_out)
                 h = torch.cat([h, hs.pop() + control.pop()], dim=1)
             h = module(h, emb, encoder_out)
+
         h = h.type(self.dtype)
         h = self.out(h)
-        return h.type(input_type)
+        if output_vanilla:
+            h_vanilla = h_vanilla.type(self.dtype)
+            h_vanilla = self.out(h_vanilla)
+            return h.type(input_type), h_vanilla.type(input_type)
+        else:
+            return h.type(input_type)
 
 class ControlNet(nn.Module):
 
@@ -988,3 +1000,13 @@ class ControlNet(nn.Module):
         h = self.middle_block(h, emb, encoder_out)
         outs.append(self.middle_block_out(h, emb, encoder_out))
         return outs
+    
+class OverallModel(nn.Module):
+    def __init__(self, controlled_unet, control_net):
+        super().__init__()
+        self.controlled_unet = controlled_unet
+        self.control_net = control_net
+    
+    def forward(self, x, timesteps, cond_text=None, **kwargs):
+        control = self.control_net(x, timesteps, cond_text=cond_text, **kwargs)
+        return self.controlled_unet(x, timesteps, cond_text=cond_text, control=control, **kwargs)
