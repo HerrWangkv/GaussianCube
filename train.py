@@ -417,6 +417,7 @@ class FinetuneLoop:
     def __init__(
         self,
         model,
+        controlnet,
         diffusion,
         batch_size,
         microbatch,
@@ -445,6 +446,7 @@ class FinetuneLoop:
     ):
 
         self.model = model
+        self.controlnet = controlnet
         self.diffusion = diffusion
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
@@ -498,7 +500,7 @@ class FinetuneLoop:
             self.mean = th.tensor([0]).to(th.float32).to(dist_util.dev())
             self.std = th.tensor([1]).to(th.float32).to(dist_util.dev())
         
-        self.optimize_model = self.model
+        self.optimize_model = self.controlnet
         self.model_params = list(self.optimize_model.parameters())
         self.master_params = self.model_params
         self.lg_loss_scale = FINETUNE_INITIAL_LOG_LOSS_SCALE
@@ -530,8 +532,8 @@ class FinetuneLoop:
 
         if th.cuda.is_available():
             self.use_ddp = True
-            self.ddp_model = DDP(
-                self.model,
+            self.ddp_controlnet = DDP(
+                self.controlnet,
                 device_ids=[dist_util.dev()],
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
@@ -545,7 +547,7 @@ class FinetuneLoop:
                     "Gradients will not be synchronized properly!"
                 )
             self.use_ddp = False
-            self.ddp_model = self.model
+            self.ddp_controlnet = self.controlnet
 
         self.use_tensorboard = use_tensorboard
         if self.use_tensorboard and dist.get_rank() == 0:
@@ -576,14 +578,14 @@ class FinetuneLoop:
             'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
         }
         self.neg_prompts_2d = {
-            'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels",
-            'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
-            'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
-            'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like",
-            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, single color",
-            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, single color",
-            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, single color",
-            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, single color",
+            'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, unrealistic proportions",
+            'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
+            'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
+            'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
+            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, single color, unrealistic proportions",
+            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, single color, unrealistic proportions",
+            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, single color, unrealistic proportions",
+            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, single color, unrealistic proportions",
         }
     def _load_and_sync_parameters(self):
         resume_checkpoint = self.resume_checkpoint
@@ -593,9 +595,9 @@ class FinetuneLoop:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
             if dist.get_rank() == 0:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-                self.model.load_state_dict(th.load(resume_checkpoint, map_location="cpu"),strict=False)
+                self.controlnet.load_state_dict(th.load(resume_checkpoint, map_location="cpu"),strict=False)
 
-        dist_util.sync_params(self.model.parameters())
+        dist_util.sync_params(self.controlnet.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.master_params)
@@ -657,6 +659,15 @@ class FinetuneLoop:
         logger.logkv_mean("step_time", step_time)
         self.log_step()
     
+    def get_pretrained_pred_x0(self, output, t):
+        if self.diffusion.model_mean_type == ModelMeanType.START_X:
+            pred_x0 = output['pretrained_output'] 
+        elif self.diffusion.model_mean_type == ModelMeanType.V:
+            pred_x0 = self.diffusion._predict_start_from_z_and_v(x_t=output['x_t'], t=t, v=output['pretrained_output'])
+        else:
+            pred_x0 = self.diffusion._predict_xstart_from_eps(output['x_t'], t, output['pretrained_output'])
+        return pred_x0
+    
     def get_pred_x0(self, output, t):
         if self.diffusion.model_mean_type == ModelMeanType.START_X:
             pred_x0 = output['model_output'] 
@@ -679,7 +690,10 @@ class FinetuneLoop:
             if cams is None:
                 for k, v in cam.items():
                     if not isinstance(v, th.Tensor):
-                        cam[k] = th.tensor([v])
+                        if isinstance(v, np.ndarray):
+                            cam[k] = th.tensor(np.array([v]))
+                        else:
+                            cam[k] = th.tensor([v])
                     else:
                         cam[k] = v.unsqueeze(0)
                 cams = cam
@@ -719,7 +733,7 @@ class FinetuneLoop:
             self.dpm_solver = DPM_Solver(model_fn, self.noise_schedule, algorithm_type='dpmsolver++')
             samples = self.dpm_solver.sample(
                 x=noise,
-                steps=100,
+                steps=20,
                 t_start=1.0,
                 t_end=float(t[0]/self.diffusion.num_timesteps),
                 order=2,
@@ -729,21 +743,28 @@ class FinetuneLoop:
             text_features[th.rand(len(text_features)) < self.uncond_p] *= 0
             micro_cond = {"cond_text": text_features}
             t = th.expand_copy(t, (samples.shape[0],))
-            output = self.diffusion.model_output(self.ddp_model, samples, t, micro_cond)
+            output = self.diffusion.model_output(self.model, self.ddp_controlnet, samples, t, micro_cond)
 
             self.has_pretrain_weight = self.has_pretrain_weight or self.step >= 50_000 or self.resume_step > 0
+            pretrained_pred_x0_denorm = None
             pred_x0_denorm = None
+            pretrained_pred_x0 = self.get_pretrained_pred_x0(output, t)
             pred_x0 = self.get_pred_x0(output, t)
+            pretrained_pred_x0_denorm = pretrained_pred_x0 * self.std + self.mean
             pred_x0_denorm = pred_x0 * self.std + self.mean
             cams = self.load_random_cams(len(text_cond))
-            pred_imgs, gt_imgs = [], []
+            pretrained_imgs, pred_imgs, gt_imgs = [], [], []
             for b in range(len(text_cond)):
                 cam = build_single_viewpoint_cam(cams, 0)
+                with th.no_grad():
+                    pretrained_res = render(cam, pretrained_pred_x0_denorm[b], self.std_volume, self.bg_color, self.active_sh_degree)
+                pretrained_imgs.append(pretrained_res["render"])
                 res = render(cam, pred_x0_denorm[b], self.std_volume, self.bg_color, self.active_sh_degree)
                 pred_imgs.append(res["render"])
-                gt_img = self.img_refiner.refine(pos_prompts[b], neg_prompts[b], res["render"][None,:,:,:]) # TODO:run in parallel
+                gt_img = self.img_refiner.refine(pos_prompts[b], neg_prompts[b], pretrained_res["render"][None,:,:,:]) # TODO:run in parallel
                 gt_imgs.append(gt_img[0])
 
+            pretrained_img = th.stack(pretrained_imgs, dim=0)
             pred_img = th.stack(pred_imgs, dim=0)
             gt_img = th.stack(gt_imgs, dim=0)
             pixel_l1_loss = self.L1loss(pred_img, gt_img) * self.render_l1_weight
@@ -755,9 +776,15 @@ class FinetuneLoop:
                 losses["vgg_loss"] = th.tensor([vgg_loss])
                 loss += vgg_loss
                 
-            if self.step % 10 == 0 and dist.get_rank() == 0:
+            if self.step % 100 == 0 and dist.get_rank() == 0:
                 s_path = os.path.join(logger.get_dir(), 'train_images')
                 os.makedirs(s_path,exist_ok=True)
+
+                pre_image = pretrained_img[0].clamp(0.0, 1.0)
+                rgb_map = pre_image.squeeze().permute(1, 2, 0).cpu() 
+                rgb_map = (rgb_map.detach().numpy() * 255).astype('uint8')
+                imageio.imwrite(os.path.join(s_path, "pretrained_iter_{:08}_t_{:02}.png".format(self.step, int(t[-1]))), rgb_map)
+
                 output_image = pred_img[0].clamp(0.0, 1.0)
                 rgb_map = output_image.squeeze().permute(1, 2, 0).cpu() 
                 rgb_map = (rgb_map.detach().numpy() * 255).astype('uint8')

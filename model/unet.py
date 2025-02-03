@@ -704,3 +704,287 @@ class SuperResUNetModel(UNetModel):
             timestep_embedding(aug_steps, self.model_channels, dtype=self.dtype)
         )
         return super().forward(x, timesteps, aug_emb=aug_emb, **kwargs)
+
+class ControlledUNetModel(UNetModel):
+    def forward(self, x, timesteps, cond_text=None, control=None, **kwargs):
+        hs = []
+        with torch.no_grad():
+            input_type = x.dtype
+            emb = self.time_embed(timestep_embedding(timesteps, self.model_channels, dtype=self.dtype))
+
+            encoder_out = None
+            if cond_text is not None:
+                cond_text = cond_text.type(self.dtype)
+                encoder_out = self.encoder_proj(cond_text)
+                encoder_out = encoder_out.permute(0, 2, 1)  # NLC -> NCL
+                encoder_pool = self.encoder_pooling(cond_text)
+                emb = emb + encoder_pool.to(emb)
+
+            emb = self.activation_layer(emb)
+
+            h = x.type(self.dtype)
+            for module in self.input_blocks:
+                h = module(h, emb, encoder_out)
+                hs.append(h)
+            h = self.middle_block(h, emb, encoder_out)
+
+        if control is not None:
+            h += control.pop()
+
+        for module in self.output_blocks:
+            if control is None:
+                h = torch.cat([h, hs.pop()], dim=1)
+            else:
+                h = torch.cat([h, hs.pop() + control.pop()], dim=1)
+            h = module(h, emb, encoder_out)
+        h = h.type(self.dtype)
+        h = self.out(h)
+        return h.type(input_type)
+
+class ControlNet(nn.Module):
+
+    def __init__(
+            self,
+            in_channels,
+            model_channels,
+            num_res_blocks,
+            attention_resolutions,
+            activation,
+            encoder_dim,
+            att_pool_heads,
+            encoder_channels,
+            image_size,
+            disable_self_attentions=None,
+            dropout=0,
+            channel_mult=(1, 2, 4, 8),
+            conv_resample=True,
+            dims=2,
+            precision='32',
+            num_heads=1,
+            num_head_channels=-1,
+            num_heads_upsample=-1,
+            use_scale_shift_norm=False,
+            resblock_updown=False,
+            efficient_activation=False,
+            scale_skip_connection=False,
+            unconditional_gen=False,
+    ):
+        super().__init__()
+
+        if num_heads_upsample == -1:
+            num_heads_upsample = num_heads
+
+        self.encoder_channels = encoder_channels
+        self.encoder_dim = encoder_dim
+        self.efficient_activation = efficient_activation
+        self.scale_skip_connection = scale_skip_connection
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.dropout = dropout
+        self.unconditional_gen = unconditional_gen
+        self.image_size = image_size
+        self.dims = dims 
+
+        # adapt attention resolutions
+        if isinstance(attention_resolutions, str):
+            self.attention_resolutions = []
+            for res in attention_resolutions.split(','):
+                self.attention_resolutions.append(image_size // int(res))
+        else:
+            self.attention_resolutions = attention_resolutions
+        self.attention_resolutions = tuple(self.attention_resolutions)
+        #
+
+        # adapt disable self attention resolutions
+        if not disable_self_attentions:
+            self.disable_self_attentions = []
+        elif disable_self_attentions is True:
+            self.disable_self_attentions = attention_resolutions
+        elif isinstance(disable_self_attentions, str):
+            self.disable_self_attentions = []
+            for res in disable_self_attentions.split(','):
+                self.disable_self_attentions.append(image_size // int(res))
+        else:
+            self.disable_self_attentions = disable_self_attentions
+        self.disable_self_attentions = tuple(self.disable_self_attentions)
+        #
+
+        # adapt channel mult
+        if isinstance(channel_mult, str):
+            self.channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(','))
+        else:
+            self.channel_mult = tuple(channel_mult)
+        #
+
+        self.conv_resample = conv_resample
+        self.dtype = torch.float32
+
+        self.precision = str(precision)
+        self.use_fp16 = precision == '16'
+        if self.precision == '16':
+            self.dtype = torch.float16
+        elif self.precision == 'bf16':
+            self.dtype = torch.bfloat16
+
+        self.num_heads = num_heads
+        self.num_head_channels = num_head_channels
+        self.num_heads_upsample = num_heads_upsample
+
+        self.time_embed_dim = model_channels * max(self.channel_mult)
+        self.time_embed = nn.Sequential(
+            linear(model_channels, self.time_embed_dim, dtype=self.dtype),
+            get_activation(activation),
+            linear(self.time_embed_dim, self.time_embed_dim, dtype=self.dtype),
+        )
+
+        ch = input_ch = int(self.channel_mult[0] * model_channels)
+        self.input_blocks = nn.ModuleList(
+            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1, dtype=self.dtype))]
+        )
+        self.zero_convs = nn.ModuleList([self.make_zero_conv(model_channels)])
+
+        self._feature_size = ch
+        input_block_chans = [ch]
+        ds = 1
+
+        if isinstance(num_res_blocks, int):
+            num_res_blocks = [num_res_blocks]*len(self.channel_mult)
+        self.num_res_blocks = num_res_blocks
+
+        for level, mult in enumerate(self.channel_mult):
+            for _ in range(num_res_blocks[level]):
+                layers = [
+                    ResBlock(
+                        ch,
+                        self.time_embed_dim,
+                        dropout,
+                        out_channels=int(mult * model_channels),
+                        dims=dims,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                        dtype=self.dtype,
+                        activation=activation,
+                        efficient_activation=self.efficient_activation,
+                        scale_skip_connection=self.scale_skip_connection,
+                    )
+                ]
+                ch = int(mult * model_channels)
+                if ds in self.attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            num_heads=num_heads,
+                            num_head_channels=num_head_channels,
+                            encoder_channels=encoder_channels,
+                            dtype=self.dtype,
+                            disable_self_attention=ds in self.disable_self_attentions,
+                        )
+                    )
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self.zero_convs.append(self.make_zero_conv(ch))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(self.channel_mult) - 1:
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(
+                        ResBlock(
+                            ch,
+                            self.time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            down=True,
+                            dtype=self.dtype,
+                            activation=activation,
+                            efficient_activation=self.efficient_activation,
+                            scale_skip_connection=self.scale_skip_connection,
+                        )
+                        if resblock_updown
+                        else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+                    )
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                self.zero_convs.append(self.make_zero_conv(ch))
+                ds *= 2
+                self._feature_size += ch
+
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                ch,
+                self.time_embed_dim,
+                dropout,
+                dims=dims,
+                use_scale_shift_norm=use_scale_shift_norm,
+                dtype=self.dtype,
+                activation=activation,
+                efficient_activation=self.efficient_activation,
+                scale_skip_connection=self.scale_skip_connection,
+            ),
+            AttentionBlock(
+                ch,
+                num_heads=num_heads,
+                num_head_channels=num_head_channels,
+                encoder_channels=encoder_channels,
+                dtype=self.dtype,
+                disable_self_attention=ds in self.disable_self_attentions,
+            ),
+            ResBlock(
+                ch,
+                self.time_embed_dim,
+                dropout,
+                dims=dims,
+                use_scale_shift_norm=use_scale_shift_norm,
+                dtype=self.dtype,
+                activation=activation,
+                efficient_activation=self.efficient_activation,
+                scale_skip_connection=self.scale_skip_connection,
+            ),
+        )
+        self.middle_block_out = self.make_zero_conv(ch)
+        self._feature_size += ch
+
+        self.activation_layer = get_activation(activation) if self.efficient_activation else nn.Identity()
+
+        if not self.unconditional_gen:
+            self.encoder_pooling = nn.Sequential(
+                nn.LayerNorm(encoder_dim, dtype=self.dtype),
+                AttentionPooling(att_pool_heads, encoder_dim, dtype=self.dtype),
+                nn.Linear(encoder_dim, self.time_embed_dim, dtype=self.dtype),
+                nn.LayerNorm(self.time_embed_dim, dtype=self.dtype)
+            )
+            if encoder_dim != encoder_channels:
+                self.encoder_proj = nn.Linear(encoder_dim, encoder_channels, dtype=self.dtype)
+            else:
+                self.encoder_proj = nn.Identity()
+
+    def make_zero_conv(self, channels):
+        return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0, dtype=self.dtype))) 
+
+    def forward(self, x, timesteps, cond_text=None, class_labels=None, aug_emb=None, use_cache=False, **kwargs):
+        input_type = x.dtype
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels, dtype=self.dtype))
+        
+        encoder_out = None
+        if cond_text is not None:
+            cond_text = cond_text.type(self.dtype)
+            encoder_out = self.encoder_proj(cond_text)
+            encoder_out = encoder_out.permute(0, 2, 1)  # NLC -> NCL
+            encoder_pool = self.encoder_pooling(cond_text)
+            emb = emb + encoder_pool.to(emb)
+        elif class_labels is not None:
+            label_emb = self.label_emb(class_labels)
+            emb = emb + label_emb.to(emb)
+
+        emb = self.activation_layer(emb)
+        outs = []
+
+        h = x.type(self.dtype)
+        for module, zero_conv in zip(self.input_blocks, self.zero_convs):
+            h = module(h, emb, encoder_out)
+            outs.append(zero_conv(h, emb, encoder_out))
+
+        h = self.middle_block(h, emb, encoder_out)
+        outs.append(self.middle_block_out(h, emb, encoder_out))
+        return outs

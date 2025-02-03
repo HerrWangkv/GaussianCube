@@ -5,7 +5,7 @@ import torch.utils.cpp_extension
 from omegaconf import OmegaConf
 from huggingface_hub import hf_hub_download
 
-from model.unet import UNetModel
+from model.unet import ControlledUNetModel, ControlNet
 from model.resample import UniformSampler
 from utils import dist_util, logger
 from utils.script_util import create_gaussian_diffusion
@@ -62,7 +62,8 @@ def main():
     dist_util.setup_dist()
     torch.cuda.set_device(dist_util.dev())
 
-    model = UNetModel(**model_and_diffusion_config['model'])
+    model = ControlledUNetModel(**model_and_diffusion_config['model'])
+    controlnet = ControlNet(**model_and_diffusion_config['controlnet'])
     diffusion = create_gaussian_diffusion(**model_and_diffusion_config['diffusion'])
     has_pretrain_weight = True
     downloaded_files = download_model_files()
@@ -70,10 +71,13 @@ def main():
     mean_file = downloaded_files["mean"]
     std_file = downloaded_files["std"]
     bound = downloaded_files["bound"]
+    model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+    for param in model.parameters():
+        param.requires_grad_(False)
     if args.ckpt is not None:
-        model.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
+        controlnet.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
     else:
-        model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        controlnet.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=False)
 
     logger.configure(args.exp_name)
     options = logger.args_to_dict(args)
@@ -81,6 +85,7 @@ def main():
         logger.save_args(options)
 
     model.to(dist_util.dev())
+    controlnet.to(dist_util.dev())
     print("num of params: {} M".format(sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6))
 
     schedule_sampler = UniformSampler(model_and_diffusion_config['diffusion']['steps'])
@@ -91,6 +96,7 @@ def main():
     logger.log("training...")
     FinetuneLoop(
         model,
+        controlnet,
         diffusion,
         batch_size=args.batch_size,
         microbatch=args.microbatch,
@@ -130,7 +136,7 @@ def create_argparser():
     parser.add_argument("--use_fp16", action="store_true")
     parser.add_argument("--use_tensorboard", action="store_true")
     # Model config
-    parser.add_argument("--config", type=str, default="configs/nuscenes_finetune.yml")
+    parser.add_argument("--config", type=str, default="configs/finetune.yml")
     # Train args
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--microbatch", type=int, default=0)

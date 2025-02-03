@@ -141,7 +141,7 @@ class SpacedDiffusion(gd.GaussianDiffusion):
         return super().training_losses(self._wrap_model(model), *args, **kwargs)
 
     def model_output(
-        self, model, x_t, t, model_kwargs=None
+        self, model, controlnet, x_t, t, model_kwargs=None
     ):
         """
         Predict the output of a model from dpm sampled data.
@@ -150,7 +150,10 @@ class SpacedDiffusion(gd.GaussianDiffusion):
             model_kwargs = {}
 
         assert self.loss_type == gd.LossType.MSE or self.loss_type == gd.LossType.RESCALED_MSE
-        model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+        control = controlnet(x_t, self._scale_timesteps(t), **model_kwargs)
+        with torch.no_grad():
+            pretrained_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+        model_output = model(x_t, self._scale_timesteps(t), control=control, **model_kwargs)
 
         if self.model_var_type in [
             gd.ModelVarType.LEARNED,
@@ -158,8 +161,9 @@ class SpacedDiffusion(gd.GaussianDiffusion):
         ]:
             B, C = x_t.shape[:2]
             assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-            model_output, model_var_values = torch.split(model_output, C, dim=1)
-        return {'x_t': x_t, 'model_output': model_output}
+            pretrained_output, _ = torch.split(pretrained_output, C, dim=1)
+            model_output, _ = torch.split(model_output, C, dim=1)
+        return {'x_t': x_t, 'pretrained_output': pretrained_output, 'model_output': model_output}
 
 
     def _wrap_model(self, model):
