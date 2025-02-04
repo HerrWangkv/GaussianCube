@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from pyquaternion import Quaternion
+# from pyquaternion import Quaternion
 from utils import dist_util, logger
 from utils.fp16_util import (
     make_master_params,
@@ -19,7 +19,7 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
-from gsplat.rendering import rasterization
+# from gsplat.rendering import rasterization
 from kiui.cam import orbit_camera
 
 from utils.script_util import init_volume_grid
@@ -965,143 +965,143 @@ def log_loss_dict(diffusion, ts, losses):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
 
-def centerlize_and_scale_initial_gs(gs, size):
-    valid_mask = gs['opacities'].squeeze()!=0
-    x_min, x_max = gs['xyz'][valid_mask, 0].min(), gs['xyz'][valid_mask, 0].max()
-    y_min, y_max = gs['xyz'][valid_mask, 1].min(), gs['xyz'][valid_mask, 1].max()
-    z_min, z_max = gs['xyz'][valid_mask, 2].min(), gs['xyz'][valid_mask, 2].max()
-    center = th.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]).to(dist_util.dev())
-    gs['xyz'] -= center
-    initial_size = th.tensor([x_max - x_min, y_max - y_min, z_max - z_min]).to(dist_util.dev())
-    # swap size[0] and size[1]
-    size[[0, 1]] = size[[1, 0]]
-    scale = size / initial_size
-    gs['xyz'] *= scale
-    gs['scales'] *= scale
-    return gs
+# def centerlize_and_scale_initial_gs(gs, size):
+#     valid_mask = gs['opacities'].squeeze()!=0
+#     x_min, x_max = gs['xyz'][valid_mask, 0].min(), gs['xyz'][valid_mask, 0].max()
+#     y_min, y_max = gs['xyz'][valid_mask, 1].min(), gs['xyz'][valid_mask, 1].max()
+#     z_min, z_max = gs['xyz'][valid_mask, 2].min(), gs['xyz'][valid_mask, 2].max()
+#     center = th.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]).to(dist_util.dev())
+#     gs['xyz'] -= center
+#     initial_size = th.tensor([x_max - x_min, y_max - y_min, z_max - z_min]).to(dist_util.dev())
+#     # swap size[0] and size[1]
+#     size[[0, 1]] = size[[1, 0]]
+#     scale = size / initial_size
+#     gs['xyz'] *= scale
+#     gs['scales'] *= scale
+#     return gs
 
-def quat_multiply(quaternion0, quaternion1):
-    w0, x0, y0, z0 = th.split(quaternion0, 1, dim=-1)
-    w1, x1, y1, z1 = th.split(quaternion1, 1, dim=-1)
-    w = -x1 * x0 - y1 * y0 - z1 * z0 + w1 * w0
-    x = x1 * w0 - y1 * z0 + z1 * y0 + w1 * x0
-    y = x1 * z0 + y1 * w0 - z1 * x0 + w1 * y0
-    z = -x1 * y0 + y1 * x0 + z1 * w0 + w1 * z0
+# def quat_multiply(quaternion0, quaternion1):
+#     w0, x0, y0, z0 = th.split(quaternion0, 1, dim=-1)
+#     w1, x1, y1, z1 = th.split(quaternion1, 1, dim=-1)
+#     w = -x1 * x0 - y1 * y0 - z1 * z0 + w1 * w0
+#     x = x1 * w0 - y1 * z0 + z1 * y0 + w1 * x0
+#     y = x1 * z0 + y1 * w0 - z1 * x0 + w1 * y0
+#     z = -x1 * y0 + y1 * x0 + z1 * w0 + w1 * z0
 
-    return th.concat((w, x, y, z), dim=-1)
+#     return th.concat((w, x, y, z), dim=-1)
 
-def rotation_matrix_to_quaternion(matrix: th.Tensor) -> th.Tensor:
-    """
-    Converts a 3x3 rotation matrix to a quaternion.
+# def rotation_matrix_to_quaternion(matrix: th.Tensor) -> th.Tensor:
+#     """
+#     Converts a 3x3 rotation matrix to a quaternion.
 
-    Parameters:
-    matrix (th.Tensor): A 3x3 rotation matrix.
+#     Parameters:
+#     matrix (th.Tensor): A 3x3 rotation matrix.
 
-    Returns:
-    th.Tensor: A quaternion [w, x, y, z].
-    """
-    if matrix.shape != (3, 3):
-        raise ValueError("Input matrix must be 3x3.")
+#     Returns:
+#     th.Tensor: A quaternion [w, x, y, z].
+#     """
+#     if matrix.shape != (3, 3):
+#         raise ValueError("Input matrix must be 3x3.")
 
-    # Compute the trace of the matrix
-    trace = th.trace(matrix)
+#     # Compute the trace of the matrix
+#     trace = th.trace(matrix)
 
-    if trace > 0:
-        S = 2.0 * th.sqrt(trace + 1.0)
-        w = 0.25 * S
-        x = (matrix[2, 1] - matrix[1, 2]) / S
-        y = (matrix[0, 2] - matrix[2, 0]) / S
-        z = (matrix[1, 0] - matrix[0, 1]) / S
-    elif (matrix[0, 0] > matrix[1, 1]) and (matrix[0, 0] > matrix[2, 2]):
-        S = 2.0 * th.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])
-        w = (matrix[2, 1] - matrix[1, 2]) / S
-        x = 0.25 * S
-        y = (matrix[0, 1] + matrix[1, 0]) / S
-        z = (matrix[0, 2] + matrix[2, 0]) / S
-    elif matrix[1, 1] > matrix[2, 2]:
-        S = 2.0 * th.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])
-        w = (matrix[0, 2] - matrix[2, 0]) / S
-        x = (matrix[0, 1] + matrix[1, 0]) / S
-        y = 0.25 * S
-        z = (matrix[1, 2] + matrix[2, 1]) / S
-    else:
-        S = 2.0 * th.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])
-        w = (matrix[1, 0] - matrix[0, 1]) / S
-        x = (matrix[0, 2] + matrix[2, 0]) / S
-        y = (matrix[1, 2] + matrix[2, 1]) / S
-        z = 0.25 * S
+#     if trace > 0:
+#         S = 2.0 * th.sqrt(trace + 1.0)
+#         w = 0.25 * S
+#         x = (matrix[2, 1] - matrix[1, 2]) / S
+#         y = (matrix[0, 2] - matrix[2, 0]) / S
+#         z = (matrix[1, 0] - matrix[0, 1]) / S
+#     elif (matrix[0, 0] > matrix[1, 1]) and (matrix[0, 0] > matrix[2, 2]):
+#         S = 2.0 * th.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])
+#         w = (matrix[2, 1] - matrix[1, 2]) / S
+#         x = 0.25 * S
+#         y = (matrix[0, 1] + matrix[1, 0]) / S
+#         z = (matrix[0, 2] + matrix[2, 0]) / S
+#     elif matrix[1, 1] > matrix[2, 2]:
+#         S = 2.0 * th.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])
+#         w = (matrix[0, 2] - matrix[2, 0]) / S
+#         x = (matrix[0, 1] + matrix[1, 0]) / S
+#         y = 0.25 * S
+#         z = (matrix[1, 2] + matrix[2, 1]) / S
+#     else:
+#         S = 2.0 * th.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])
+#         w = (matrix[1, 0] - matrix[0, 1]) / S
+#         x = (matrix[0, 2] + matrix[2, 0]) / S
+#         y = (matrix[1, 2] + matrix[2, 1]) / S
+#         z = 0.25 * S
 
-    return th.tensor([w, x, y, z])
+#     return th.tensor([w, x, y, z])
 
-def rotate_gs(rotation_matrix, gs):
-    '''
-    Args:
-        rotation_matrix: 3x3 rotation matrix
-    '''
-    rotated_xyz = gs['xyz'] @ rotation_matrix.T
-    rotated_rotations = F.normalize(quat_multiply(
-        rotation_matrix_to_quaternion(rotation_matrix).to(dist_util.dev()),
-        gs['rots'],
-    ))
-    gs['xyz'] = rotated_xyz.to(th.float32)
-    gs['rots'] = rotated_rotations.to(th.float32)
-    return gs
+# def rotate_gs(rotation_matrix, gs):
+#     '''
+#     Args:
+#         rotation_matrix: 3x3 rotation matrix
+#     '''
+#     rotated_xyz = gs['xyz'] @ rotation_matrix.T
+#     rotated_rotations = F.normalize(quat_multiply(
+#         rotation_matrix_to_quaternion(rotation_matrix).to(dist_util.dev()),
+#         gs['rots'],
+#     ))
+#     gs['xyz'] = rotated_xyz.to(th.float32)
+#     gs['rots'] = rotated_rotations.to(th.float32)
+#     return gs
 
-def translate_gs(translation, gs):
-    '''
-    Args:
-        translation: 3 translation vector
-    '''
-    gs['xyz'] += translation
-    return gs
+# def translate_gs(translation, gs):
+#     '''
+#     Args:
+#         translation: 3 translation vector
+#     '''
+#     gs['xyz'] += translation
+#     return gs
 
-def transform_gs(transformation_matrix, gs):
-        '''
-        Args:
-            transformation_matrix: 4x4 transformation matrix
-        '''
-        transformation_matrix = th.tensor(transformation_matrix).to(dist_util.dev())
-        gs = rotate_gs(transformation_matrix[:3, :3], gs)
-        gs = translate_gs(transformation_matrix[:3, 3], gs)
-        return gs
+# def transform_gs(transformation_matrix, gs):
+#         '''
+#         Args:
+#             transformation_matrix: 4x4 transformation matrix
+#         '''
+#         transformation_matrix = th.tensor(transformation_matrix).to(dist_util.dev())
+#         gs = rotate_gs(transformation_matrix[:3, :3], gs)
+#         gs = translate_gs(transformation_matrix[:3, 3], gs)
+#         return gs
 
-def render_gs(gs, intrinsics, extrinsics, bg_color):
-    extrinsics = th.tensor(extrinsics).float().to(dist_util.dev())
-    intrinsics = th.tensor(intrinsics).float().to(dist_util.dev())
-    means = gs["xyz"]
-    f_dc = gs["shs"].squeeze()
-    opacities = gs["opacities"]
-    scales = gs["scales"]
-    rotations = gs["rots"]
+# def render_gs(gs, intrinsics, extrinsics, bg_color):
+#     extrinsics = th.tensor(extrinsics).float().to(dist_util.dev())
+#     intrinsics = th.tensor(intrinsics).float().to(dist_util.dev())
+#     means = gs["xyz"]
+#     f_dc = gs["shs"].squeeze()
+#     opacities = gs["opacities"]
+#     scales = gs["scales"]
+#     rotations = gs["rots"]
 
-    rgbs = th.sigmoid(f_dc)
-    renders, _, _ = rasterization(
-        means=means,
-        quats=rotations,
-        scales=scales,
-        opacities=opacities.squeeze(),
-        colors=rgbs,
-        viewmats=th.linalg.inv(extrinsics)[None, ...],  # [C, 4, 4]
-        Ks=intrinsics[None, ...],  # [C, 3, 3]
-        width=1600,
-        height=900,
-        packed=False,
-        absgrad=True,
-        sparse_grad=False,
-        rasterize_mode="classic",
-        near_plane=0.1,
-        far_plane=10000000000.0,
-        render_mode="RGB",
-        radius_clip=0.,
-        backgrounds=bg_color,
-    )
-    renders = th.clamp(renders, max=1.0)
-    return renders
+#     rgbs = th.sigmoid(f_dc)
+#     renders, _, _ = rasterization(
+#         means=means,
+#         quats=rotations,
+#         scales=scales,
+#         opacities=opacities.squeeze(),
+#         colors=rgbs,
+#         viewmats=th.linalg.inv(extrinsics)[None, ...],  # [C, 4, 4]
+#         Ks=intrinsics[None, ...],  # [C, 3, 3]
+#         width=1600,
+#         height=900,
+#         packed=False,
+#         absgrad=True,
+#         sparse_grad=False,
+#         rasterize_mode="classic",
+#         near_plane=0.1,
+#         far_plane=10000000000.0,
+#         render_mode="RGB",
+#         radius_clip=0.,
+#         backgrounds=bg_color,
+#     )
+#     renders = th.clamp(renders, max=1.0)
+#     return renders
 
 
-def place_and_render_gs(gs, size, obj_to_cam_front, intrinsics, extrinsics, bg_color):
-    gs = centerlize_and_scale_initial_gs(gs, size.to(dist_util.dev()))
-    gs = transform_gs(obj_to_cam_front.to(dist_util.dev()), gs)
-    render = render_gs(gs, intrinsics.to(dist_util.dev()), extrinsics.to(dist_util.dev()), bg_color.to(dist_util.dev()))
-    return render[0].permute(2, 0, 1)
+# def place_and_render_gs(gs, size, obj_to_cam_front, intrinsics, extrinsics, bg_color):
+#     gs = centerlize_and_scale_initial_gs(gs, size.to(dist_util.dev()))
+#     gs = transform_gs(obj_to_cam_front.to(dist_util.dev()), gs)
+#     render = render_gs(gs, intrinsics.to(dist_util.dev()), extrinsics.to(dist_util.dev()), bg_color.to(dist_util.dev()))
+#     return render[0].permute(2, 0, 1)
 
