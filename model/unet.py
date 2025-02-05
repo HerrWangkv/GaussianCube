@@ -731,7 +731,7 @@ class ControlledUNetModel(UNetModel):
 
         if control is not None:
             if output_vanilla:
-                h_vanilla = torch.tensor(h)
+                h_vanilla = h.clone().detach()
                 hs_vanilla = hs.copy()
             h += control.pop()
         for module in self.output_blocks:

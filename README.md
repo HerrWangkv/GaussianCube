@@ -27,6 +27,7 @@ cd GaussianCube
 conda create -n gaussiancube python=3.9 -y
 conda activate gaussiancube
 pip install -r requirements.txt
+(conda install -c conda-forge gxx_linux-64=9.3.0)
 pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
 ```
 
