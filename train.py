@@ -558,34 +558,50 @@ class FinetuneLoop:
         self.noise_schedule = NoiseScheduleVP(schedule='discrete', betas=th.from_numpy(diffusion.betas).to(dist_util.dev()))
         self.img_refiner = StableDiffusion(device=dist_util.dev(), fp16=False, vram_O=False)
         self.prompts_3d = {
-            'vehicle.car': "vehicle car",
+            # 'vehicle.car': "vehicle car",
             'human.pedestrian.adult': "human pedestrian adult with natural skin color",
             'human.pedestrian.child': "human pedestrian child with natural skin",
             'human.pedestrian.construction_worker': "human construction worker with natural skin color",
-            'vehicle.bicycle': "bicycle",
-            'vehicle.bus': "vehicle bus",
-            'vehicle.motorcycle': "vehicle motorcycle",
-            'vehicle.truck': "vehicle truck",
+            'human.pedestrian.police_officer': "human police officer with natural skin color",
+            # 'vehicle.bicycle': "bicycle",
+            # 'vehicle.bus': "vehicle bus",
+            # 'vehicle.motorcycle': "vehicle motorcycle",
+            # 'vehicle.truck': "vehicle truck",
         }
+        self.ratios = {
+            # 'vehicle.car': 42.30,
+            'human.pedestrian.adult': 17.86,
+            'human.pedestrian.child': 0.18,
+            'human.pedestrian.construction_worker': 0.79,
+            'human.pedestrian.police_officer': 0.06,
+            # 'vehicle.bicycle': 0.5,
+            # 'vehicle.bus': 0.5,
+            # 'vehicle.motorcycle': 0.5,
+            # 'vehicle.truck': 0.5,
+        }
+        for k, v in self.ratios.items():
+            self.ratios[k] = v / sum(self.ratios.values())
         self.pos_prompts_2d = {
-            'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+            # 'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
             'human.pedestrian.adult': "A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features",
             'human.pedestrian.child': "A realistic child pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features",
             'human.pedestrian.construction_worker': "A realistic construction worker walking or standing naturally, photorealistic body proportions, natural skin color, wearing detailed safety gear, sharp facial features",
-            'vehicle.bicycle': "A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration",
-            'vehicle.bus': "A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
-            'vehicle.motorcycle': "A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures",
-            'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
+            'human.pedestrian.police_officer': "A realistic police officer walking or standing naturally, photorealistic body proportions, natural skin color, wearing detailed police uniform, sharp facial features",
+            # 'vehicle.bicycle': "A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration",
+            # 'vehicle.bus': "A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+            # 'vehicle.motorcycle': "A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures",
+            # 'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
         }
         self.neg_prompts_2d = {
-            'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, unrealistic proportions",
+            # 'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, unrealistic proportions",
             'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
             'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
             'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
-            'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, unrealistic uniform colors, unrealistic proportions",
-            'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
-            'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, unrealistic uniform colors, unrealistic proportions",
-            'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
+            'human.pedestrian.police_officer': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions",
+            # 'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, unrealistic uniform colors, unrealistic proportions",
+            # 'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
+            # 'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, unrealistic uniform colors, unrealistic proportions",
+            # 'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
         }
     def _load_and_sync_parameters(self):
         resume_checkpoint = self.resume_checkpoint
@@ -633,8 +649,9 @@ class FinetuneLoop:
             not self.lr_anneal_steps
             or self.step <= self.lr_anneal_steps
         ):  
-            keys = [key for key in self.prompts_3d]
-            keys = np.random.choice(list(self.prompts_3d.keys()), self.batch_size, replace=True)
+            assert len(self.prompts_3d) == len(self.pos_prompts_2d) == len(self.neg_prompts_2d) == len(self.ratios)
+            cats, ratios = list(self.ratios.keys()), list(self.ratios.values())
+            keys = np.random.choice(cats, self.batch_size, p=ratios)
             prompts_3d = [self.prompts_3d[key] for key in keys]
             pos_prompts_2d = [self.pos_prompts_2d[key] for key in keys]
             neg_prompts_2d = [self.neg_prompts_2d[key] for key in keys]

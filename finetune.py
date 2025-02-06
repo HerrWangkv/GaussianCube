@@ -131,7 +131,7 @@ def create_argparser():
     parser.add_argument("--exp_name", type=str, default="/tmp/output/")
     parser.add_argument("--resume_checkpoint", type=str, default=None)
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--save_interval", type=int, default=5000)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--use_fp16", action="store_true")
     parser.add_argument("--use_tensorboard", action="store_true")
