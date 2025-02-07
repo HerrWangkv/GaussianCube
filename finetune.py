@@ -4,6 +4,7 @@ import torch.distributed as dist
 import torch.utils.cpp_extension
 from omegaconf import OmegaConf
 from huggingface_hub import hf_hub_download
+import wandb
 
 from model.unet import ControlledUNetModel, ControlNet
 from model.resample import UniformSampler
@@ -55,7 +56,7 @@ def download_model_files():
 
 def main():
     args = create_argparser().parse_args()
-
+    wandb.init(project="finetune", sync_tensorboard=True)
     model_and_diffusion_config = OmegaConf.load(args.config)
     print("Model and Diffusion config: ", model_and_diffusion_config)
 

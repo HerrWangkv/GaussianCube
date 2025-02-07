@@ -4,3 +4,4 @@ build/
 dist/
 experiments
 videos
+wandb
