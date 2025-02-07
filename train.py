@@ -579,8 +579,9 @@ class FinetuneLoop:
             # 'vehicle.motorcycle': 0.5,
             # 'vehicle.truck': 0.5,
         }
+        sum_ratios = sum(self.ratios.values())
         for k, v in self.ratios.items():
-            self.ratios[k] = v / sum(self.ratios.values())
+            self.ratios[k] = v / sum_ratios
         self.pos_prompts_2d = {
             # 'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
             'human.pedestrian.adult': "A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual modern clothing with realistic folds and textures, sharp facial features",
