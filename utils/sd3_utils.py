@@ -197,7 +197,7 @@ class StableDiffusion(nn.Module):
         return prompt_embeds, pooled_prompt_embeds
     
     @torch.no_grad()
-    def refine(self, prompts, negative_prompts, pred_rgb, begin_index=800):
+    def refine(self, prompts, negative_prompts, pred_rgb, begin_index=600):
         if isinstance(prompts, str):
             prompts = [prompts]
         if isinstance(negative_prompts, str):
@@ -215,6 +215,7 @@ class StableDiffusion(nn.Module):
         assert 2 * latents.shape[0] == text_embeds.shape[0]
         noise = torch.randn_like(latents)
         dummy_t = torch.tensor([[begin_index]] * latents.shape[0], dtype=torch.long, device=self.device)
+        self.scheduler.set_timesteps(1000)
         self.scheduler.set_begin_index(begin_index)
         latents_noisy = self.scheduler.scale_noise(latents, dummy_t, noise)
 
