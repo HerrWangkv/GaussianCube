@@ -23,9 +23,9 @@ from utils.fp16_util import (
 from kiui.cam import orbit_camera
 
 from utils.script_util import init_volume_grid
-from utils.sd3_utils import StableDiffusion
 from dataset.dataset_render import load_cam
 from model.nn import update_ema
+from model.unet import OverallModel
 from model.resample import UniformSampler
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver
@@ -443,10 +443,15 @@ class FinetuneLoop:
         bound=0.45,
         has_pretrain_weight=False,
         num_pts_each_axis=32,
+        prompts_3d=None,
+        pos_prompts_2d=None,
+        neg_prompts_2d=None,
+        sd=None
     ):
 
         self.model = model
         self.controlnet = controlnet
+        self.overall_model = OverallModel(model, controlnet)
         self.diffusion = diffusion
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
@@ -556,41 +561,11 @@ class FinetuneLoop:
         if th.cuda.is_available():
             self.clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
         self.noise_schedule = NoiseScheduleVP(schedule='discrete', betas=th.from_numpy(diffusion.betas).to(dist_util.dev()))
-        self.img_refiner = StableDiffusion(device=dist_util.dev(), fp16=False, vram_O=False)
-        self.prompts_3d = {
-            # 'vehicle.car': "vehicle car",
-            'human.pedestrian.adult': "human pedestrian adult with natural skin color",
-            'human.pedestrian.child': "human pedestrian child with natural skin",
-            'human.pedestrian.construction_worker': "human construction worker with natural skin color",
-            'human.pedestrian.police_officer': "human police officer with natural skin color",
-            # 'vehicle.bicycle': "bicycle",
-            # 'vehicle.bus': "vehicle bus",
-            # 'vehicle.motorcycle': "vehicle motorcycle",
-            # 'vehicle.truck': "vehicle truck",
-        }
+        self.img_refiner = sd(device=dist_util.dev(), fp16=False, vram_O=False)
+        self.prompts_3d = prompts_3d
+        self.pos_prompts_2d = pos_prompts_2d
+        self.neg_prompts_2d = neg_prompts_2d
 
-        self.pos_prompts_2d = {
-            # 'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
-            'human.pedestrian.adult': "A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual shoes and modern clothing with realistic folds and textures, well-defined facial features with smooth, symmetrical proportions and natural details",
-            'human.pedestrian.child': "A realistic child pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual shoes and  modern clothing with realistic folds and textures, well-defined facial features with smooth, symmetrical proportions and natural details",
-            'human.pedestrian.construction_worker': "A realistic construction worker walking or standing naturally, photorealistic body proportions, natural skin color, wearing safety gear, well-defined facial features with smooth, symmetrical proportions and natural details",
-            'human.pedestrian.police_officer': "A realistic police officer walking or standing naturally, photorealistic body proportions, natural skin color, wearing police uniform, well-defined facial features with smooth, symmetrical proportions and natural details",
-            # 'vehicle.bicycle': "A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration",
-            # 'vehicle.bus': "A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
-            # 'vehicle.motorcycle': "A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures",
-            # 'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
-        }
-        self.neg_prompts_2d = {
-            # 'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, unrealistic proportions",
-            'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
-            'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
-            'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
-            'human.pedestrian.police_officer': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
-            # 'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, unrealistic uniform colors, unrealistic proportions",
-            # 'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
-            # 'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, unrealistic uniform colors, unrealistic proportions",
-            # 'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
-        }
     def _load_and_sync_parameters(self):
         resume_checkpoint = self.resume_checkpoint
 
@@ -663,15 +638,6 @@ class FinetuneLoop:
         logger.logkv_mean("step_time", step_time)
         self.log_step()
     
-    def get_pretrained_pred_x0(self, output, t):
-        if self.diffusion.model_mean_type == ModelMeanType.START_X:
-            pred_x0 = output['pretrained_output'] 
-        elif self.diffusion.model_mean_type == ModelMeanType.V:
-            pred_x0 = self.diffusion._predict_start_from_z_and_v(x_t=output['x_t'], t=t, v=output['pretrained_output'])
-        else:
-            pred_x0 = self.diffusion._predict_xstart_from_eps(output['x_t'], t, output['pretrained_output'])
-        return pred_x0
-    
     def get_pred_x0(self, output, t):
         if self.diffusion.model_mean_type == ModelMeanType.START_X:
             pred_x0 = output['model_output'] 
@@ -725,7 +691,7 @@ class FinetuneLoop:
                 t, _ = self.schedule_sampler.sample(1, dist_util.dev())
             sample_shape = (len(text_cond), self.model.in_channels, self.model.image_size, self.model.image_size, self.model.image_size)
             noise = th.randn(sample_shape, device=dist_util.dev())
-            model_fn = model_wrapper(
+            pretrained_model_fn = model_wrapper(
                 self.model,
                 self.noise_schedule,
                 model_type="x_start", #TODO config it
@@ -735,8 +701,30 @@ class FinetuneLoop:
                 condition=condition,
                 unconditional_condition=unconditional_condition,
             )
-            self.dpm_solver = DPM_Solver(model_fn, self.noise_schedule, algorithm_type='dpmsolver++')
-            samples = self.dpm_solver.sample(
+            self.pretrained_dpm_solver = DPM_Solver(pretrained_model_fn, self.noise_schedule, algorithm_type='dpmsolver++')
+            
+            finetuned_model_fn = model_wrapper(
+                self.overall_model,
+                self.noise_schedule,
+                model_type="x_start", #TODO config it
+                model_kwargs={},
+                guidance_type="classifier-free",
+                guidance_scale=3.5,
+                condition=condition,
+                unconditional_condition=unconditional_condition,
+            )
+            self.finetuned_dpm_solver = DPM_Solver(finetuned_model_fn, self.noise_schedule, algorithm_type='dpmsolver++')
+            pretrained_samples = self.pretrained_dpm_solver.sample(
+                x=noise,
+                steps=20,
+                t_start=1.0,
+                t_end=float(1/self.diffusion.num_timesteps),
+                order=2,
+                skip_type='time_uniform',
+                method='adaptive',
+            )
+
+            noisy_finetuned_samples = self.finetuned_dpm_solver.sample(
                 x=noise,
                 steps=20,
                 t_start=1.0,
@@ -747,13 +735,13 @@ class FinetuneLoop:
             )
             text_features[th.rand(len(text_features)) < self.uncond_p] *= 0
             micro_cond = {"cond_text": text_features}
-            t = th.expand_copy(t, (samples.shape[0],))
-            output = self.diffusion.model_output(self.model, self.ddp_controlnet, samples, t, micro_cond)
+            t = th.expand_copy(t, (noisy_finetuned_samples.shape[0],))
+            output = self.diffusion.model_output(self.model, self.ddp_controlnet, noisy_finetuned_samples, t, micro_cond)
 
             self.has_pretrain_weight = self.has_pretrain_weight or self.step >= 50_000 or self.resume_step > 0
             pretrained_pred_x0_denorm = None
             pred_x0_denorm = None
-            pretrained_pred_x0 = self.get_pretrained_pred_x0(output, t)
+            pretrained_pred_x0 = pretrained_samples
             pred_x0 = self.get_pred_x0(output, t)
             pretrained_pred_x0_denorm = pretrained_pred_x0 * self.std + self.mean
             pred_x0_denorm = pred_x0 * self.std + self.mean

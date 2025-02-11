@@ -52,3 +52,7 @@ diffusion:
   predict_xstart: true
   rescale_timesteps: true
   rescale_learned_sigmas: true
+
+finetune:
+  stable_diffusion: "3.5"
+  category: "human"

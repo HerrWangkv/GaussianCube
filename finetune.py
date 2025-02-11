@@ -92,9 +92,54 @@ def main():
     schedule_sampler = UniformSampler(model_and_diffusion_config['diffusion']['steps'])
 
     logger.log("creating data loader...")
-
+    prompts_3d = {
+        'human.pedestrian.adult': "human pedestrian adult with natural skin color",
+        'human.pedestrian.child': "human pedestrian child with natural skin",
+        'human.pedestrian.construction_worker': "human construction worker with natural skin color",
+        'human.pedestrian.police_officer': "human police officer with natural skin color",
+        'vehicle.car': "vehicle car",
+        'vehicle.bicycle': "bicycle",
+        'vehicle.bus': "vehicle bus",
+        'vehicle.motorcycle': "vehicle motorcycle",
+        'vehicle.truck': "vehicle truck",
+    }
+    pos_prompts_2d = {
+        'human.pedestrian.adult': "A realistic adult pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual shoes and modern clothing with realistic folds and textures, well-defined facial features with smooth, symmetrical proportions and natural details",
+        'human.pedestrian.child': "A realistic child pedestrian walking or standing naturally, photorealistic body proportions, natural skin color, wearing casual shoes and  modern clothing with realistic folds and textures, well-defined facial features with smooth, symmetrical proportions and natural details",
+        'human.pedestrian.construction_worker': "A realistic construction worker walking or standing naturally, photorealistic body proportions, natural skin color, wearing safety gear, well-defined facial features with smooth, symmetrical proportions and natural details",
+        'human.pedestrian.police_officer': "A realistic police officer walking or standing naturally, photorealistic body proportions, natural skin color, wearing police uniform, well-defined facial features with smooth, symmetrical proportions and natural details",
+        'vehicle.car': "A hyper-realistic car with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+        'vehicle.bicycle': "A realistic bicycle with a metal frame in natural colors, rubber tires and leather seat. The chain and spokes retain metallic tones with slight rust or discoloration",
+        'vehicle.bus': "A hyper-realistic bus with a metallic or painted body, glass windows, rubber tiles and ultra-detailed textures",
+        'vehicle.motorcycle': "A hyper-realistic motorcycle with a metal frame, shiny chrome accents, detailed rubber tires and ltra-detailed textures",
+        'vehicle.truck': "A hyper-realistic truck in diverse colors with a large metal frame,glass windows and detailed wheels and ultra-detailed textures",
+    }
+    neg_prompts_2d = {
+        'human.pedestrian.adult': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
+        'human.pedestrian.child': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
+        'human.pedestrian.construction_worker': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
+        'human.pedestrian.police_officer': "cartoonish, warped features, blurry textures, mannequin-like, robot-like, unrealistic proportions, doll-like appearance, unnatural smiles",
+        'vehicle.car': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, unrealistic proportions",
+        'vehicle.bicycle': "unnatural bright or neon colors, cartoonish appearance, overly smooth surfaces, glossy unrealistic finishes, unrealistic rubber textures, unnatural tire tread patterns, distorted wheels, unrealistic uniform colors, unrealistic proportions",
+        'vehicle.bus': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on windows or wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
+        'vehicle.motorcycle': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, painterly, warped surfaces, misshapen parts, low detail on wheels or engine, toy-like, unrealistic uniform colors, unrealistic proportions",
+        'vehicle.truck': "cartoonish, blurry textures, jagged edges, surreal effects, distorted geometry, warped surfaces, misshapen parts, low detail on wheels, toy-like, unrealistic uniform colors, unrealistic proportions",
+    }
     #TODO: manage uncond_p in TrainLoop
     logger.log("training...")
+    selected_prompts_3d = {key: prompts_3d[key] for key in prompts_3d if model_and_diffusion_config['finetune']['category'] in key}
+    selected_pos_prompts_2d = {key: pos_prompts_2d[key] for key in pos_prompts_2d if model_and_diffusion_config['finetune']['category'] in key}
+    selected_neg_prompts_2d = {key: neg_prompts_2d[key] for key in neg_prompts_2d if model_and_diffusion_config['finetune']['category'] in key}
+    if model_and_diffusion_config['finetune']['stable_diffusion'] in ['2.1']:
+        from utils.sd_utils import StableDiffusion
+        sd = StableDiffusion
+    elif model_and_diffusion_config['finetune']['stable_diffusion'] in ['3.5']:
+        from utils.sd3_utils import StableDiffusion
+        sd = StableDiffusion
+    else:
+        raise ValueError('Unknown stable_diffusion!')
+
+
     FinetuneLoop(
         model,
         controlnet,
@@ -119,6 +164,10 @@ def main():
         bound=bound,#args.bound,
         has_pretrain_weight=has_pretrain_weight,
         num_pts_each_axis=args.num_pts_each_axis,
+        prompts_3d=selected_prompts_3d,
+        pos_prompts_2d=selected_pos_prompts_2d,
+        neg_prompts_2d=selected_neg_prompts_2d,
+        sd=sd
     ).run_loop()
 
  
@@ -132,7 +181,7 @@ def create_argparser():
     parser.add_argument("--exp_name", type=str, default="/tmp/output/")
     parser.add_argument("--resume_checkpoint", type=str, default=None)
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--save_interval", type=int, default=5000)
+    parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--use_fp16", action="store_true")
     parser.add_argument("--use_tensorboard", action="store_true")
@@ -147,7 +196,7 @@ def create_argparser():
     parser.add_argument("--ema_rate", type=float, default=0.9999)
     parser.add_argument("--uncond_p", type=float, default=0.2)
     parser.add_argument("--render_l1_weight", type=float, default=1.0)
-    parser.add_argument("--render_lpips_weight", type=float, default=1.0)
+    parser.add_argument("--render_lpips_weight", type=float, default=0.0)
     # Data args
     parser.add_argument("--num_pts_each_axis", type=int, default=32)
  
