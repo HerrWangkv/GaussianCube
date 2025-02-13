@@ -195,8 +195,8 @@ def create_argparser():
     parser.add_argument("--use_vgg", action="store_true")
     parser.add_argument("--ema_rate", type=float, default=0.9999)
     parser.add_argument("--uncond_p", type=float, default=0.2)
-    parser.add_argument("--render_l1_weight", type=float, default=1.0)
-    parser.add_argument("--render_lpips_weight", type=float, default=0.0)
+    parser.add_argument("--render_l1_weight", type=float, default=0.0)
+    parser.add_argument("--render_lpips_weight", type=float, default=1.0)
     # Data args
     parser.add_argument("--num_pts_each_axis", type=int, default=32)
  
