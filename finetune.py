@@ -93,10 +93,10 @@ def main():
 
     logger.log("creating data loader...")
     prompts_3d = {
-        'human.pedestrian.adult': "human pedestrian adult with natural skin color",
-        'human.pedestrian.child': "human pedestrian child with natural skin",
-        'human.pedestrian.construction_worker': "human construction worker with natural skin color",
-        'human.pedestrian.police_officer': "human police officer with natural skin color",
+        'human.pedestrian.adult': "human pedestrian adult",
+        'human.pedestrian.child': "human pedestrian child",
+        'human.pedestrian.construction_worker': "human construction worker",
+        'human.pedestrian.police_officer': "human police officer",
         'vehicle.car': "vehicle car",
         'vehicle.bicycle': "bicycle",
         'vehicle.bus': "vehicle bus",
