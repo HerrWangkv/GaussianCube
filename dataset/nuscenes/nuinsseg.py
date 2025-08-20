@@ -73,7 +73,7 @@ class NuInsSeg(NuScenes):
                     Rs = cocomask.frPyObjects(mask, 900, 1600)
                     mask = cocomask.decode(Rs)
                 assert len(mask.shape) == 3
-                masks[cam] = mask[:,:,0]
+                masks[cam] = np.logical_or.reduce(mask, axis=2)
         return masks
 
     def render_2d_annotation(self, sample, sample_annotation_token) -> None:

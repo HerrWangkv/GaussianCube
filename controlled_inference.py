@@ -254,6 +254,11 @@ def main():
             pretrained_samples_denorm = pretrained_samples * std + mean
             finetuned_samples_denorm = finetuned_samples * std + mean
 
+            if args.save_finetuned:
+                s_path = os.path.join(logger.get_dir(), 'finetuned_models')
+                os.makedirs(s_path,exist_ok=True)
+                torch.save(finetuned_samples_denorm[0], os.path.join(s_path, "rank_{:02}_sample_{:06}.pt".format(dist.get_rank(), img_id)))
+
             pretrained_frames = []
             for i, cam_info in enumerate(model_kwargs["cams"]):
                 cam = build_single_viewpoint_cam(cam_info, 0)
@@ -321,6 +326,7 @@ def create_argparser():
     parser.add_argument("--render_video", action="store_true")
     parser.add_argument("--text", type=str, default="A donut with blue frosting and sprinkles.")
     parser.add_argument("--controlnet_ckpt", "-c", required=True, type=str)
+    parser.add_argument("--save_finetuned", action="store_true")
     return parser
 
 
