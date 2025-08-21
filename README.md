@@ -24,8 +24,7 @@ We recommend Linux for performance and compatibility reasons. We use conda to ma
 ```
 git clone https://github.com/GaussianCube/GaussianCube.git
 cd GaussianCube
-conda env create -f environment.yml
-conda activate gaussiancube
+docker build -t gaussiancube .
 ```
 
 ## Model Download
