@@ -1,0 +1,67 @@
+# SDS LoRA Fine-tuning Configuration for GaussianCube
+# This configuration implements Score Distillation Sampling with LoRA adaptation
+
+# GaussianCube Model Configuration
+model:
+  dims: 3
+  image_size: 32
+  model_channels: 128
+  num_res_blocks: 3
+  channel_mult: "1,2,3,4"
+  attention_resolutions: "8,4"
+  num_heads: 1
+  num_head_channels: 64
+  num_heads_upsample: -1
+  use_scale_shift_norm: true
+  dropout: 0.0
+  resblock_updown: true
+  encoder_dim: 768
+  encoder_channels: 512
+  in_channels: 14
+  out_channels: 28
+  activation: "silu"
+  att_pool_heads: 64
+  disable_self_attentions: false
+  unconditional_gen: false
+  precision: "16"
+
+# Diffusion Process Configuration
+diffusion:
+  steps: 1000
+  learn_sigma: true
+  sigma_small: false
+  use_kl: false
+  noise_schedule: "cosine"
+  predict_type: "xstart"  # Predict x0 for better SDS training
+  predict_xstart: true
+  rescale_timesteps: true
+  rescale_learned_sigmas: true
+
+# LoRA Configuration
+lora:
+  lora_rank: 16                   # Your default rank setting
+  lora_alpha: 64                  # Updated to match your bash script
+  lora_dropout: 0.1               # Your default dropout setting
+  lora_target_modules: 
+    - "Linear"
+    - "Conv1d"
+    - "Conv2d"
+    - "Conv3d"
+  lora_exclude_modules:
+    - "time_embed"
+    - "label_emb"
+    - "out" 
+    - "encoder_pooling"
+
+# SDS Training Configuration
+sds:
+  sd_version: "2.1"               # Stable Diffusion version
+  sds_guidance_scale: 3.5          # Your default guidance scale
+  sds_t_range: [0.02, 0.98]       # Timestep range for SDS
+  sds_timestep_range: [0.3, 0.7]  # Timestep range for random intermediate timestep selection
+  sds_vram_O: false                # Memory optimization
+  sds_negative_prompt: "blurry, bad quality, distorted, toy-like, cartoon-like"  # Default negative prompt
+  render_views: 4
+  elevation_range: [-10, 10]
+  fovx_range: [0.8, 1.2]
+  cam_radius_range: [1.0, 3.0]

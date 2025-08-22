@@ -323,6 +323,7 @@ class Object3D:
         x_min, x_max = self._initial_gs['xyz'][valid_mask, 0].min(), self._initial_gs['xyz'][valid_mask, 0].max()
         y_min, y_max = self._initial_gs['xyz'][valid_mask, 1].min(), self._initial_gs['xyz'][valid_mask, 1].max()
         z_min, z_max = self._initial_gs['xyz'][valid_mask, 2].min(), self._initial_gs['xyz'][valid_mask, 2].max()
+        # TODO: some splats are opaque
         center = torch.tensor([(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]).cuda()
         self._initial_gs['xyz'] -= center
         initial_size = torch.tensor([x_max - x_min, y_max - y_min, z_max - z_min]).cuda()

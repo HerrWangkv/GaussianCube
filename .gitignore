@@ -6,3 +6,5 @@ experiments
 wandb
 videos
 tmp
+output
+.cache
