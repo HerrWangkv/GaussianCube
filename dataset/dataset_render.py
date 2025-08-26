@@ -52,17 +52,26 @@ class InferenceDataset(Dataset):
             data_dict["class_labels"] = class_label
 
         azimuth = np.arange(0, 360, 6, dtype=np.int32)
-        elevation = -30
-        cam_radius = np.sqrt(16.25) if self.class_cond else 2.0 if self.text_cond else 1.2
+        elevation = -10
+        cam_radius = (
+            1.0  # np.sqrt(16.25) if self.class_cond else 2.0 if self.text_cond else 1.2
+        )
         cams = []
         convert_mat = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]).astype(np.float32)
         for azi in azimuth:
             cam_poses = orbit_camera(elevation, azi, radius=cam_radius, opengl=True)
             cam_poses = convert_mat @ cam_poses
-            cams.append(load_cam(c2w=cam_poses, class_cond=self.class_cond))
+            cams.append(
+                load_cam(
+                    c2w=cam_poses,
+                    class_cond=self.class_cond,
+                    orig_image_size=1024,
+                    fovx=1.13,
+                )
+            )
         data_dict["cams"] = cams
         return data_dict
-        
+
 
 def load_cam(c2w, class_cond=False, orig_image_size=512, fovx=None):
     if fovx is None:
@@ -74,7 +83,7 @@ def load_cam(c2w, class_cond=False, orig_image_size=512, fovx=None):
     R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
     T = w2c[:3, 3]
     fovy = focal2fov(fov2focal(fovx, orig_image_size), orig_image_size)
-    
+
     R = R
     T = T
     FoVx = fovx

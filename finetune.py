@@ -6,15 +6,18 @@ using Score Distillation Sampling (SDS) from Stable Diffusion 2.1.
 """
 
 import argparse
+from tqdm import trange
 import copy
 import os
 import time
 import glob
 import imageio
+import contextlib
 import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.distributed as dist
+from PIL import Image
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from omegaconf import OmegaConf
@@ -37,7 +40,7 @@ from model.lora_unet import convert_unet_to_lora, LoRAUNetModel
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver
 from model.unet import UNetModel
-from utils.sd_utils import StableDiffusion
+from utils.refiner_utils import StableDiffusionXLRefiner
 from gaussian_renderer import render
 
 # Initial loss scale for FP16 training
@@ -86,6 +89,14 @@ MODEL_REPOS = {
         "bound": 0.35
     }
 }
+
+
+def ignore_stderr(func):
+    def wrapper(*args, **kwargs):
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def download_model_files(model_name):
@@ -166,13 +177,11 @@ class LoRAFinetuneLoop:
         lora_dropout=0.1,
         lora_target_modules=None,
         lora_exclude_modules=None,
-        # SDS configuration
-        sd_version="2.1",
-        sds_guidance_scale=100,
-        sds_t_range=[0.02, 0.98],
-        sds_timestep_range=(0.3, 0.7),
-        sds_vram_O=True,
-        sds_negative_prompt="blurry, bad quality, distorted",
+        # Guidance configuration
+        timestep_range=(0.3, 0.7),
+        strength=0.5,
+        guidance_scale=10.0,
+        vram_O=True,
         render_views=4,
         elevation_range=(-10, 10),
         fovx_range=(0.8, 1.2),
@@ -198,11 +207,9 @@ class LoRAFinetuneLoop:
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
             sd_version: Stable Diffusion version
-            sds_guidance_scale: SDS guidance scale
-            sds_t_range: Timestep range for SDS sampling
+            guidance_scale: guidance scale
             prompt_file: File containing training prompts
-            sds_negative_prompt: Negative prompt for SDS
-            sds_timestep_range: Range (min, max) for random intermediate timestep selection
+            timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
             ... (other parameters similar to TrainLoop)
         """
@@ -246,9 +253,11 @@ class LoRAFinetuneLoop:
         self.weight_decay = weight_decay
         self.max_steps = max_steps
         self.max_grad_norm = max_grad_norm
-
+        self.noise_schedule = NoiseScheduleVP(
+            schedule="discrete",
+            betas=th.from_numpy(self.diffusion.betas).to(dist_util.dev()),
+        )
         # Inference configuration
-        self.sds_timestep_range = sds_timestep_range
         self.image_save_interval = image_save_interval
 
         # LoRA configuration
@@ -256,15 +265,11 @@ class LoRAFinetuneLoop:
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
 
-        # SDS configuration
-        self.sd_version = sd_version
-        self.sds_guidance_scale = sds_guidance_scale
+        # Guidance configuration
+        self.guidance_scale = guidance_scale
         self.render_views = render_views
-        if sd_version in ["2.1"]:
-            self.render_resolution = 768
-        elif sd_version in ["1.5"]:
-            self.render_resolution = 512
-        self.sds_negative_prompt = sds_negative_prompt
+        self.timestep_range = timestep_range
+        self.render_resolution = 1024
 
         # Training state
         self.step = 0
@@ -280,19 +285,21 @@ class LoRAFinetuneLoop:
         self.min_cam_radius, self.max_cam_radius = cam_radius_range
 
         # Initialize Stable Diffusion for SDS
-        print(f"Initializing Stable Diffusion {sd_version} for SDS...")
-        self.sd = StableDiffusion(
+        print(f"Initializing Stable Diffusion XL Refiner for guidance...")
+        self.refiner = StableDiffusionXLRefiner(
             device=dist_util.dev(),
             fp16=use_fp16,
-            vram_O=sds_vram_O,
-            sd_version=sd_version,
-            t_range=sds_t_range
+            vram_O=vram_O,
+            refiner_strength=strength,
         )
 
         # Initialize CLIP text encoder for GaussianCube diffusion conditioning
         print("Initializing CLIP text encoder for GaussianCube conditioning...")
         self.clip_text_encoder = FrozenCLIPEmbedder()
         self.clip_text_encoder = self.clip_text_encoder.eval().to(dist_util.dev())
+
+        # Initialize dpm_solver
+        # Setup noise schedule
 
         # Load prompts for SDS guidance
         self.prompts = self._load_prompts(prompt_file)
@@ -367,6 +374,14 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
+            self.original_ddp_model = DDP(
+                self.original_model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -375,6 +390,7 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
+            self.original_ddp_model = self.original_model
 
         # Tensorboard setup
         self.use_tensorboard = use_tensorboard
@@ -457,11 +473,17 @@ class LoRAFinetuneLoop:
 
     def run_loop(self):
         """Main training loop."""
-        print(f"Starting LoRA fine-tuning with SDS guidance...")
+        print(f"Starting LoRA fine-tuning with SDXL guidance...")
         print(f"LoRA rank: {self.lora_rank}, alpha: {self.lora_alpha}")
-        print(f"SDS guidance scale: {self.sds_guidance_scale}")
+        print(f"Guidance scale: {self.guidance_scale}")
 
-        while self.step <= self.max_steps:
+        if dist.get_rank() == 0:
+            iterator = trange(
+                self.step, self.max_steps + 1, desc="Training", dynamic_ncols=True
+            )
+        else:
+            iterator = range(self.step, self.max_steps + 1)
+        for _ in iterator:
             self.run_step()
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
@@ -495,7 +517,9 @@ class LoRAFinetuneLoop:
         return pred_x0
 
     def load_random_cams(self, cam_num):
-        azimuth = np.random.randint(0, 360, cam_num).astype(np.int32)
+        offset = np.random.uniform(0, 360)
+        azimuth = (np.linspace(0, 360, cam_num, endpoint=False) + offset) % 360
+        azimuth = azimuth.astype(np.int32)
         elevation = np.random.randint(self.min_elevation, self.max_elevation, cam_num).astype(np.int32)
         cam_radius = np.random.uniform(self.min_cam_radius, self.max_cam_radius, cam_num).astype(np.float32)
         fovx = np.random.uniform(self.min_fovx, self.max_fovx, cam_num).astype(np.float32)
@@ -527,39 +551,83 @@ class LoRAFinetuneLoop:
                         cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
         return cams
 
-    def generate_sds_camera_views(self, pred_x0_denorm):
+    def generate_sds_camera_views(self, pred_x0_denorm, denoised_denorm):
         """Generate camera views for SDS loss computation."""
-        rendered_images = []
+        predicted_rendered_images = []
+        denoised_rendered_images = []
 
         # Generate multiple camera viewpoints
         cams = self.load_random_cams(self.render_views)
         for view_idx in range(self.render_views):
             cam = build_single_viewpoint_cam(cams, view_idx)
             res = render(cam, pred_x0_denorm[0], self.std_volume, self.bg_color, self.active_sh_degree)
-            rendered_images.append(res["render"])
+            predicted_rendered_images.append(res["render"])
+            res = render(
+                cam,
+                denoised_denorm[0],
+                self.std_volume,
+                self.bg_color,
+                self.active_sh_degree,
+            )
+            denoised_rendered_images.append(res["render"])
 
-        return th.stack(rendered_images, dim=0)  # [views, 3, H, W]
+        return th.stack(predicted_rendered_images, dim=0), th.stack(
+            denoised_rendered_images, dim=0
+        )  # [views, 3, H, W]
 
-    def compute_sds_loss(self, pred_x0_denorm, prompt, save_guidance_path=None):
-        """Compute SDS loss for the predicted x0."""
-        # Generate multiple camera views of the 3D object
-        rendered_views = self.generate_sds_camera_views(pred_x0_denorm)
-
-        # Get text embeddings for the prompt
-        pos_embeds = self.sd.get_text_embeds([prompt] * self.render_views)
-        neg_embeds = self.sd.get_text_embeds([self.sds_negative_prompt] * self.render_views)
-        text_embeds = th.cat([neg_embeds, pos_embeds], dim=0)
-
-        # Compute SDS loss
-        sds_loss = self.sd.compute_sds_loss(
-            text_embeddings=text_embeds,
-            pred_rgb=rendered_views,
-            guidance_scale=self.sds_guidance_scale,
-            grad_scale=1.0,
-            save_guidance_path=save_guidance_path,  # Could save guidance images occasionally
+    @ignore_stderr
+    def compute_loss(
+        self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None
+    ):
+        """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
+        Also computes reference output using the original (non-LoRA) model without gradients.
+        """
+        # Generate multiple camera views of the 3D object (LoRA model)
+        predicted_rendered_views, denoised_rendered_views = (
+            self.generate_sds_camera_views(pred_x0_denorm, denoised_denorm)
         )
 
-        return sds_loss
+        # Refine the rendered views using the refiner (LoRA model)
+        refined_output = self.refiner.refine_images(
+            images=denoised_rendered_views,
+            prompt=[prompt] * denoised_rendered_views.shape[0],
+            negative_prompt=[""] * denoised_rendered_views.shape[0],
+            guidance_scale=self.guidance_scale,
+            output_type="pt",
+        )
+        if isinstance(refined_output, dict):
+            refined_tensors = refined_output["images"]
+        else:
+            refined_tensors = refined_output
+        if save_guidance_path:
+            # Save rendered views and refined images side by side for visualization
+            # Each row: [rendered_view | refined_image]
+            predicted_rendered_np = predicted_rendered_views.detach().cpu().numpy()
+            denoised_rendered_np = denoised_rendered_views.detach().cpu().numpy()
+            refined_np = refined_tensors.detach().cpu().numpy()
+            rows = []
+            for i in range(predicted_rendered_np.shape[0]):
+                # Convert to uint8 images
+                predicted_rendered_img = (
+                    np.clip(predicted_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                denoised_rendered_img = (
+                    np.clip(denoised_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                refined_img = (
+                    np.clip(refined_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                row = np.concatenate(
+                    [predicted_rendered_img, denoised_rendered_img, refined_img], axis=1
+                )
+                rows.append(row)
+            # Stack all rows vertically
+            out_img = np.concatenate(rows, axis=0)
+            Image.fromarray(out_img).save(save_guidance_path)
+        # Calculate MSE loss (LoRA)
+        mse_loss = nn.functional.mse_loss(refined_tensors, predicted_rendered_views)
+
+        return mse_loss
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -583,36 +651,37 @@ class LoRAFinetuneLoop:
             prompt
         )  # Shape: [1, seq_len, embed_dim]
 
-        # Setup noise schedule
-        noise_schedule = NoiseScheduleVP(schedule='discrete', betas=th.from_numpy(self.diffusion.betas).to(dist_util.dev()))
-
         # Create model wrapper for inference (put conditioning in model_kwargs)
         model_fn = model_wrapper(
-            self.ddp_model,  # Use DDP model consistently
-            noise_schedule,
+            self.original_ddp_model,  # Use DDP model consistently
+            self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
         )
 
         # Step 1: Run partial inference WITHOUT gradients to get partially denoised sample
         with th.no_grad():
-            dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type='dpmsolver++')
+            dpm_solver = DPM_Solver(
+                model_fn, self.noise_schedule, algorithm_type="dpmsolver++"
+            )
 
             # Run inference from t=1.0 to some intermediate point
             # This gives us a partially denoised sample
             # Lower values = more denoised (less noise), Higher values = more noisy
             intermediate_t = np.random.uniform(
-                *self.sds_timestep_range
-            )  # Random intermediate timestep for SDS
-            partially_denoised = dpm_solver.sample(
+                *self.timestep_range
+            )  # Random intermediate timestep
+            denoised, intermediates = dpm_solver.sample(
                 x=noise,
-                steps=100,  # actually ignored
+                steps=100,
                 t_start=1.0,
-                t_end=intermediate_t,
+                t_end=1.0 / self.diffusion.num_timesteps,
                 order=2,
                 skip_type="time_uniform",
-                method="adaptive",
+                method="multistep",
+                return_intermediate=True,
             )
+            partially_denoised = intermediates[int((1 - intermediate_t) * 100 + 1)]
 
         # Step 2: Now predict x0 from the partially denoised sample WITH gradients
         # Convert intermediate_t back to discrete timestep
@@ -641,21 +710,24 @@ class LoRAFinetuneLoop:
         # Get predicted x0 for SDS loss computation
         pred_x0 = self.get_pred_x0(output, final_timestep)
         pred_x0_denorm = pred_x0 * self.std + self.mean
+        denoised_denorm = denoised * self.std + self.mean
 
-        # Compute SDS loss using the predicted x0
+        # Compute loss using the predicted x0
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
-            s_path = os.path.join(logger.get_dir(), "rendered_images")
+            s_path = os.path.join(logger.get_dir(), "images")
             os.makedirs(s_path, exist_ok=True)
-            guidance_path = os.path.join(s_path, f"guidance_{self.step:08d}.png")
-            sds_loss = self.compute_sds_loss(
-                pred_x0_denorm, prompt, save_guidance_path=guidance_path
+            guidance_path = os.path.join(s_path, f"{self.step:08d}.png")
+            total_loss = self.compute_loss(
+                pred_x0_denorm,
+                denoised_denorm,
+                prompt,
+                save_guidance_path=guidance_path,
             )
         else:
-            sds_loss = self.compute_sds_loss(pred_x0_denorm, prompt)
-        total_loss = sds_loss
+            total_loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
 
         # Log losses (skip timestep-based logging since we don't have batch structure)
-        logger.logkv_mean("sds_loss", sds_loss.item())
+        logger.logkv_mean("total_loss", total_loss.item())
         logger.logkv(
             "prompt", str(prompt)
         )  # Convert to regular string to avoid numpy.str_ formatting error
@@ -663,7 +735,7 @@ class LoRAFinetuneLoop:
         # Tensorboard logging
         if self.use_tensorboard and self.step % self.log_interval == 0 and dist.get_rank() == 0:
             log_dict = {
-                "sds_loss": sds_loss.item(),
+                "total_loss": total_loss.item(),
                 "intermediate_t": intermediate_t,
                 "final_timestep": int(final_timestep[0]),
             }
@@ -878,7 +950,7 @@ def log_loss_dict(diffusion, ts, losses):
 
 
 def create_argparser():
-    """Create argument parser for SDS LoRA fine-tuning."""
+    """Create argument Parser for SDS LoRA fine-tuning."""
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for GaussianCube using SDS")
 
     # Experiment configuration
@@ -906,8 +978,7 @@ def create_argparser():
                         help="Use tensorboard for logging")
 
     # Logging configuration
-    parser.add_argument("--log_interval", type=int, default=100,
-                        help="Logging interval")
+    parser.add_argument("--log_interval", type=int, default=1, help="Logging interval")
     parser.add_argument("--save_interval", type=int, default=1000,
                         help="Model saving interval")
     parser.add_argument("--image_save_interval", type=int, default=100,
@@ -991,8 +1062,8 @@ def main():
         image_save_interval=args.image_save_interval,
         # LoRA configuration
         **configs["lora"],
-        # SDS configuration
-        **configs["sds"],
+        # Guidance configuration
+        **configs["guidance"],
         **configs["model"],
     )
 

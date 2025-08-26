@@ -40,7 +40,7 @@ diffusion:
 # LoRA Configuration
 lora:
   lora_rank: 16                   # Your default rank setting
-  lora_alpha: 64                  # Updated to match your bash script
+  lora_alpha: 16                  # Updated to match your bash script
   lora_dropout: 0.1               # Your default dropout setting
   lora_target_modules: 
     - "Linear"
@@ -53,15 +53,13 @@ lora:
     - "out" 
     - "encoder_pooling"
 
-# SDS Training Configuration
-sds:
-  sd_version: "2.1"               # Stable Diffusion version
-  sds_guidance_scale: 3.5          # Your default guidance scale
-  sds_t_range: [0.02, 0.98]       # Timestep range for SDS
-  sds_timestep_range: [0.3, 0.7]  # Timestep range for random intermediate timestep selection
-  sds_vram_O: false                # Memory optimization
-  sds_negative_prompt: "blurry, bad quality, distorted, toy-like, cartoon-like"  # Default negative prompt
-  render_views: 4
+# Guidance Configuration
+guidance:
+  timestep_range: [0.3, 0.7]
+  strength: 0.5
+  guidance_scale: 10.0
+  vram_O: false                # Memory optimization
+  render_views: 6
   elevation_range: [-10, 10]
   fovx_range: [0.8, 1.2]
-  cam_radius_range: [1.0, 3.0]
+  cam_radius_range: [1.0, 1.5]

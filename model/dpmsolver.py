@@ -1018,7 +1018,7 @@ class DPM_Solver:
                 lambda_s = ns.marginal_lambda(s)
             h = torch.min(theta * h * torch.float_power(E, -1. / order).float(), lambda_0 - lambda_s)
             nfe += order
-        print('adaptive solver nfe', nfe)
+        # print('adaptive solver nfe', nfe)
         return x
 
     def add_noise(self, x, t, noise=None):
@@ -1255,7 +1255,6 @@ class DPM_Solver:
             return x, intermediates
         else:
             return x
-
 
 
 #############################################################
