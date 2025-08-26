@@ -447,14 +447,14 @@ def load_lora_weights(model: nn.Module, path: str):
     """
     Load LoRA weights into a model.
     """
-    lora_state_dict = torch.load(path)
-    
+    lora_state_dict = torch.load(path, weights_only=True)
+
     # Create a mapping from LoRA parameter names to modules
     lora_modules = {}
     for name, module in model.named_modules():
         if hasattr(module, 'lora'):
             lora_modules[name] = module.lora
-    
+
     # Load parameters
     for param_name, param_value in lora_state_dict.items():
         # Extract module name and parameter type
@@ -462,7 +462,7 @@ def load_lora_weights(model: nn.Module, path: str):
         if len(parts) >= 3 and parts[-2] == 'lora':
             module_name = '.'.join(parts[:-2])
             param_type = parts[-1]  # 'lora_A' or 'lora_B'
-            
+
             if module_name in lora_modules:
                 if hasattr(lora_modules[module_name], param_type):
                     getattr(lora_modules[module_name], param_type).data.copy_(param_value)
