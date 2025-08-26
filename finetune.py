@@ -31,6 +31,7 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
+from utils.lpips.lpips import LPIPS
 
 from utils.script_util import build_single_viewpoint_cam, init_volume_grid, create_gaussian_diffusion
 from model.nn import update_ema
@@ -298,9 +299,6 @@ class LoRAFinetuneLoop:
         self.clip_text_encoder = FrozenCLIPEmbedder()
         self.clip_text_encoder = self.clip_text_encoder.eval().to(dist_util.dev())
 
-        # Initialize dpm_solver
-        # Setup noise schedule
-
         # Load prompts for SDS guidance
         self.prompts = self._load_prompts(prompt_file)
 
@@ -391,6 +389,9 @@ class LoRAFinetuneLoop:
             self.use_ddp = False
             self.ddp_model = self.model
             self.original_ddp_model = self.original_model
+
+        # Loss
+        self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
 
         # Tensorboard setup
         self.use_tensorboard = use_tensorboard
@@ -624,10 +625,8 @@ class LoRAFinetuneLoop:
             # Stack all rows vertically
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        # Calculate MSE loss (LoRA)
-        mse_loss = nn.functional.mse_loss(refined_tensors, predicted_rendered_views)
-
-        return mse_loss
+        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
+        return vgg_loss
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -809,6 +808,11 @@ class LoRAFinetuneLoop:
 
     def save(self):
         """Save model checkpoints."""
+        step_folder = os.path.join(
+            get_logdir(), f"step_{(self.step+self.resume_step):06d}"
+        )
+        os.makedirs(step_folder, exist_ok=True)
+
         def save_checkpoint(rate, params):
             state_dict = self._master_params_to_state_dict(params)
             if dist.get_rank() == 0:
@@ -817,7 +821,7 @@ class LoRAFinetuneLoop:
                     filename = f"lora_model{(self.step+self.resume_step):06d}.pt"
                 else:
                     filename = f"lora_ema_{rate}_{(self.step+self.resume_step):06d}.pt"
-                with open(os.path.join(get_logdir(), filename), "wb") as f:
+                with open(os.path.join(step_folder, filename), "wb") as f:
                     th.save(state_dict, f)
 
         # Save main model
@@ -829,14 +833,18 @@ class LoRAFinetuneLoop:
 
         # Save LoRA weights separately
         if dist.get_rank() == 0:
-            lora_path = os.path.join(get_logdir(), f"lora_weights_{(self.step+self.resume_step):06d}.pt")
+            lora_path = os.path.join(
+                step_folder, f"lora_weights_{(self.step+self.resume_step):06d}.pt"
+            )
             self.lora_model.save_lora_weights(lora_path)
             logger.log(f"saved LoRA weights to {lora_path}")
 
         # Save optimizer state
         if dist.get_rank() == 0:
             with open(
-                os.path.join(get_logdir(), f"lora_opt{(self.step+self.resume_step):06d}.pt"),
+                os.path.join(
+                    step_folder, f"lora_opt{(self.step+self.resume_step):06d}.pt"
+                ),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
