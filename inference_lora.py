@@ -130,9 +130,12 @@ def main():
 
     clip_text_encoder = FrozenCLIPEmbedder()
     clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
-    if args.text:
-        text_features = clip_text_encoder.encode(args.text)
-
+    if args.prompt_file is not None and os.path.exists(args.prompt_file):
+        with open(args.prompt_file, "r") as f:
+            prompts = [line.strip() for line in f.readlines() if line.strip()]
+            print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
+    else:
+        prompts = None
     val_data = load_data(
         batch_size=1,
         deterministic=True,
@@ -151,9 +154,11 @@ def main():
     mean = mean.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
     std = std.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
 
-    img_id = 0
-    num_batch_per_rank = args.num_samples // dist.get_world_size()
-    for _ in tqdm(range(num_batch_per_rank)):
+    if prompts:
+        num_batch_per_rank = args.num_samples * (len(prompts) // dist.get_world_size())
+    else:
+        num_batch_per_rank = args.num_samples // dist.get_world_size()
+    for idx in tqdm(range(num_batch_per_rank)):
 
         model_kwargs = next(val_data)  
 
@@ -165,7 +170,22 @@ def main():
             image_size,
             image_size,
         )
-
+        if prompts is not None:
+            prompt = prompts[
+                (idx + num_batch_per_rank * dist.get_rank()) // args.num_samples
+            ][11:]
+            idx_amoung_same_prompt = (
+                idx + num_batch_per_rank * dist.get_rank()
+            ) % args.num_samples
+            text_features = clip_text_encoder.encode(prompt)
+        elif args.text:
+            prompt = args.text
+            idx_amoung_same_prompt = idx + num_batch_per_rank * dist.get_rank()
+            text_features = clip_text_encoder.encode(prompt)
+        else:
+            raise ValueError(
+                "Either --text or --prompt_file must be provided for text conditioning."
+            )
         condition =  {"cond_text": text_features}
 
         model_fn = model_wrapper(
@@ -205,19 +225,39 @@ def main():
 
                 rgb_map = output_image.squeeze().permute(1, 2, 0).cpu() 
                 rgb_map = (rgb_map.detach().numpy() * 255).astype('uint8')
-                imageio.imwrite(os.path.join(s_path, "rank_{:02}_render_{:06}_cam_{:02}.png".format(dist.get_rank(), img_id, i)), rgb_map)
+                imageio.imwrite(
+                    os.path.join(
+                        s_path, f"{prompt}_{idx_amoung_same_prompt:03}_cam_{i:02}.png"
+                    ),
+                    rgb_map,
+                )
 
                 frames.append(rgb_map)
 
             samples = samples.permute(0, 2, 3, 4, 1).cpu()
-            torch.save(samples[0], os.path.join(logger.get_dir(), f"rank_{dist.get_rank():02}_{img_id:04d}" + ".pt"))
+            torch.save(
+                samples[0],
+                os.path.join(
+                    logger.get_dir(), f"{prompt}_{idx_amoung_same_prompt:03}" + ".pt"
+                ),
+            )
 
             if args.render_video:
                 s_path = os.path.join(logger.get_dir(), 'videos')
                 os.makedirs(s_path,exist_ok=True)
-                imageio.mimwrite(os.path.join(s_path, "rank_{:02}_render_{:06}.mp4".format(dist.get_rank(), img_id)), frames, fps=30)
-
-        img_id += 1
+                imageio.mimwrite(
+                    os.path.join(s_path, f"{prompt}_{idx_amoung_same_prompt:03}.mp4"),
+                    frames,
+                    fps=30,
+                )
+                # Remove images after video is rendered
+                for i in range(len(frames)):
+                    img_path = os.path.join(
+                        s_path.replace("videos", "render_images"),
+                        f"{prompt}_{idx_amoung_same_prompt:03}_cam_{i:02}.png",
+                    )
+                    if os.path.exists(img_path):
+                        os.remove(img_path)
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -238,6 +278,7 @@ def create_argparser():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--render_video", action="store_true")
     parser.add_argument("--text", type=str, default="A car.")
+    parser.add_argument("--prompt_file", type=str, default=None)
     parser.add_argument(
         "--lora_checkpoint",
         type=str,

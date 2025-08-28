@@ -1,4 +1,5 @@
 __pycache__
 videos
 .cache
-checkpoint*
+tmp
+output
