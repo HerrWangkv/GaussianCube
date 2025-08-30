@@ -529,7 +529,9 @@ class LoRAFinetuneLoop:
         for i in range(cam_num):
             cam_poses = orbit_camera(elevation[i], azimuth[i], radius=cam_radius[i], opengl=True)
             cam_poses = convert_mat @ cam_poses
-            cam = load_cam(c2w=cam_poses, fovx=fovx[i])
+            cam = load_cam(
+                c2w=cam_poses, orig_image_size=self.render_resolution, fovx=fovx[i]
+            )
             if cams is None:
                 for k, v in cam.items():
                     if not isinstance(v, th.Tensor):
