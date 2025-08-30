@@ -10,9 +10,9 @@ echo "Using 4 GPUs with MPI..."
 export NCCL_P2P_DISABLE=1
 
 # Add proper GPU binding for MPI ranks
-mpiexec -n 4 python finetune.py \
-    --exp_name ./output/gaussiancube_finetuning \
-    --config configs/finetune.yml \
+mpiexec -n 4 python finetune_vehicle.py \
+    --exp_name ./output/gaussiancube_finetuning_vehicle \
+    --config configs/finetune_vehicle.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
     --max_steps 50000 \

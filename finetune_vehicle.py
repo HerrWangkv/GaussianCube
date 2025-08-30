@@ -964,8 +964,12 @@ def create_argparser():
     # Experiment configuration
     parser.add_argument("--exp_name", type=str, required=True,
                         help="Experiment name for logging")
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to config file (e.g., configs/finetune.yml)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to config file (e.g., configs/finetune_vehicle.yml)",
+    )
     parser.add_argument("--model_name", type=str, choices=list(MODEL_REPOS.keys()),
                            help="Predefined model name to download from HuggingFace")
 

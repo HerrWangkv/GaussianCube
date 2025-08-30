@@ -3,9 +3,10 @@ import torch
 from scipy.spatial.transform import Rotation as R
 import smplx
 import math
-from typing import Dict
+from functools import lru_cache
 
 
+@lru_cache(maxsize=None)
 def recursive_unique_assignment(
     splats,
     references,
@@ -138,6 +139,7 @@ def compute_vertex_normals(vertices_np, faces_np):
     return normals
 
 
+@lru_cache(maxsize=None)
 def build_vertex_gaussians(vertices_np, faces_np, min_scale=0.002, max_scale=0.05, device="cuda"):
     V = vertices_np.shape[0]
     # adjacency for average edge length
@@ -343,15 +345,11 @@ class SMPL:
             "ratio": ratio,
             "center": center,
         }
-        if self.colors is not None:
-            normalized_splats["colors"] = self.colors
         return normalized_splats
 
-    def update_rest_attributes(self, colors, scales, quats):
+    def update_rest_attributes(self, colors):
         self.rest_colors = colors
         self.colors = colors
-        self.rest_scales = scales
-        self.rest_quats = quats
 
 
 class SMPLinGaussianCube:
@@ -426,33 +424,24 @@ class SMPLinGaussianCube:
         #     .contiguous()
         # )
         # self.initial_x0 = self.initial_x0.unsqueeze(0)
-        self.rest_attributes_updated = False
 
     def update_rest_attributes(self, x0_denorm):
         """
         x0_denorm: (num_channels, voxel_size, voxel_size, voxel_size)
         """
-        assert self.rest_attributes_updated == False
         x0_denorm = x0_denorm.permute(1, 2, 3, 0).reshape(-1, self.num_channels)
         self.splats["colors"] = x0_denorm[self.assignments, 3 : self.num_channels - 8]
-        self.splats["scales"] = x0_denorm[self.assignments, -7:-4]
-        self.splats["quats"] = x0_denorm[self.assignments, -4:]
-        self.smpl.update_rest_attributes(
-            colors=self.splats["colors"],
-            scales=self.splats["scales"] / self.splats["ratio"],
-            quats=self.splats["quats"],
-        )
-        self.rest_attributes_updated = True
+        self.smpl.update_rest_attributes(colors=self.splats["colors"])
 
     def apply_pose(self, body_pose=None, global_orient=None, transl=None):
-        if not self.rest_attributes_updated:
+        if "colors" not in self.splats:
             raise ValueError(
                 "Rest attributes not updated. Call update_rest_attributes() first."
             )
         self.smpl.apply_pose(
             body_pose=body_pose, global_orient=global_orient, transl=transl
         )
-        self.splats = self.smpl.normalize()
+        self.splats.update(self.smpl.normalize())
 
     def to_x0_denorm(self):
         x0_denorm = torch.zeros((self.N, self.num_channels), device=self.device)
