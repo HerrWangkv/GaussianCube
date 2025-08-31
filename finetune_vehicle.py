@@ -270,7 +270,7 @@ class LoRAFinetuneLoop:
         self.guidance_scale = guidance_scale
         self.render_views = render_views
         self.timestep_range = timestep_range
-        self.render_resolution = 1024
+        self.render_resolution = 512
 
         # Training state
         self.step = 0

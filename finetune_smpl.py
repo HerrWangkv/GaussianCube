@@ -31,7 +31,7 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
-from utils.similarity_loss import CLIPTextImageLoss
+from utils.lpips.lpips import LPIPS
 
 from utils.script_util import build_single_viewpoint_cam, init_volume_grid, create_gaussian_diffusion
 from model.nn import update_ema
@@ -42,9 +42,8 @@ from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_dims
 from model.unet import UNetModel
 from model.smpl import SMPLinGaussianCube
-from utils.refiner_utils import StableDiffusionXLRefiner
+from utils.sd_utils import StableDiffusion
 from gaussian_renderer import render
-from transformers import CLIPProcessor, CLIPModel
 
 # Initial loss scale for FP16 training
 INITIAL_LOG_LOSS_SCALE = 20.0
@@ -183,6 +182,9 @@ class LoRAFinetuneLoop:
         lora_exclude_modules=None,
         # Guidance configuration
         timestep_range=(0.3, 0.7),
+        strength=0.7,
+        guidance_scale=10.0,
+        vram_O=True,
         render_views=4,
         elevation_range=(-10, 10),
         fovx_range=(0.8, 1.2),
@@ -267,9 +269,10 @@ class LoRAFinetuneLoop:
         self.lora_dropout = lora_dropout
 
         # Guidance configuration
+        self.guidance_scale = guidance_scale
         self.render_views = render_views
         self.timestep_range = timestep_range
-        self.render_resolution = 224
+        self.render_resolution = 512
 
         # Training state
         self.step = 0
@@ -283,6 +286,15 @@ class LoRAFinetuneLoop:
         self.min_elevation, self.max_elevation = elevation_range
         self.min_fovx, self.max_fovx = fovx_range
         self.min_cam_radius, self.max_cam_radius = cam_radius_range
+
+        # Initialize Stable Diffusion for SDS
+        print(f"Initializing Stable Diffusion for guidance...")
+        self.refiner = StableDiffusion(
+            device=dist_util.dev(),
+            fp16=use_fp16,
+            vram_O=vram_O,
+            refiner_strength=strength,
+        )
 
         # Initialize CLIP text encoder for GaussianCube diffusion conditioning
         print("Initializing CLIP text encoder for GaussianCube conditioning...")
@@ -371,6 +383,14 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
+            self.original_ddp_model = DDP(
+                self.original_model,
+                device_ids=[dist_util.dev()],
+                output_device=dist_util.dev(),
+                broadcast_buffers=False,
+                bucket_cap_mb=128,
+                find_unused_parameters=False,
+            )
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -379,9 +399,10 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
+            self.original_ddp_model = self.original_model
 
         # Loss
-        self.clip_loss = CLIPTextImageLoss(device=dist_util.dev())
+        self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
 
         # Tensorboard setup
         self.use_tensorboard = use_tensorboard
@@ -477,6 +498,7 @@ class LoRAFinetuneLoop:
         """Main training loop."""
         print(f"Starting LoRA fine-tuning with SDXL guidance...")
         print(f"LoRA rank: {self.lora_rank}, alpha: {self.lora_alpha}")
+        print(f"Guidance scale: {self.guidance_scale}")
 
         if dist.get_rank() == 0:
             iterator = trange(
@@ -552,9 +574,10 @@ class LoRAFinetuneLoop:
                         cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
         return cams
 
-    def generate_sds_camera_views(self, pred_x0_denorm):
+    def generate_sds_camera_views(self, pred_x0_denorm, denoised_denorm):
         """Generate camera views for SDS loss computation."""
         predicted_rendered_images = []
+        denoised_rendered_images = []
 
         # Generate multiple camera viewpoints
         cams = self.load_random_cams(self.render_views)
@@ -562,34 +585,63 @@ class LoRAFinetuneLoop:
             cam = build_single_viewpoint_cam(cams, view_idx)
             res = render(cam, pred_x0_denorm, self.std_volume, self.bg_color, self.active_sh_degree)
             predicted_rendered_images.append(res["render"])
+            res = render(
+                cam,
+                denoised_denorm,
+                self.std_volume,
+                self.bg_color,
+                self.active_sh_degree,
+            )
+            denoised_rendered_images.append(res["render"])
 
-        return th.stack(predicted_rendered_images, dim=0)  # [views, 3, H, W]
+        return th.stack(predicted_rendered_images, dim=0), th.stack(
+            denoised_rendered_images, dim=0
+        )  # [views, 3, H, W]
 
     @ignore_stderr
     def compute_loss(
-        self, pred_x0_denorm, prompt, save_guidance_path=None
+        self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None
     ):
         """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
         Also computes reference output using the original (non-LoRA) model without gradients.
         """
         # Generate multiple camera views of the 3D object (LoRA model)
-        predicted_rendered_views = self.generate_sds_camera_views(pred_x0_denorm)
+        predicted_rendered_views, denoised_rendered_views = (
+            self.generate_sds_camera_views(pred_x0_denorm, denoised_denorm)
+        )
+        refined_tensors = self.refiner.refine_images(
+            images=denoised_rendered_views,
+            prompts=[prompt] * self.render_views,
+            negative_prompts=[""] * self.render_views,
+            guidance_scale=self.guidance_scale,
+        )
         if save_guidance_path:
             # Save rendered views and refined images side by side for visualization
             # Each row: [rendered_view | refined_image]
             predicted_rendered_np = predicted_rendered_views.detach().cpu().numpy()
-            columns = []
+            denoised_rendered_np = denoised_rendered_views.detach().cpu().numpy()
+            refined_np = refined_tensors.detach().cpu().numpy()
+            rows = []
             for i in range(predicted_rendered_np.shape[0]):
                 # Convert to uint8 images
                 predicted_rendered_img = (
                     np.clip(predicted_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
                 ).astype(np.uint8)
-                columns.append(predicted_rendered_img)
-            # Stack all rows horizontally
-            out_img = np.concatenate(columns, axis=1)
+                denoised_rendered_img = (
+                    np.clip(denoised_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                refined_img = (
+                    np.clip(refined_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                row = np.concatenate(
+                    [predicted_rendered_img, denoised_rendered_img, refined_img], axis=1
+                )
+                rows.append(row)
+            # Stack all rows vertically
+            out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        similarity_loss = self.clip_loss(predicted_rendered_views, [prompt] * self.render_views)
-        return similarity_loss
+        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
+        return vgg_loss
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -615,7 +667,7 @@ class LoRAFinetuneLoop:
 
         # Create model wrapper for inference (put conditioning in model_kwargs)
         model_fn = model_wrapper(
-            self.ddp_model,  # Use DDP model consistently
+            self.original_ddp_model,  # Use DDP model consistently
             self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
@@ -646,15 +698,17 @@ class LoRAFinetuneLoop:
             intermediate_t = np.random.uniform(
                 *self.timestep_range
             )  # Random intermediate timestep
-            partially_denoised = dpm_solver.sample(
+            denoised, intermediates = dpm_solver.sample(
                 x=noise,
                 steps=100,
                 t_start=1.0,
-                t_end=intermediate_t,
+                t_end=1.0 / self.diffusion.num_timesteps,
                 order=2,
                 skip_type="time_uniform",
                 method="multistep",
+                return_intermediate=True,
             )
+            partially_denoised = intermediates[int((1 - intermediate_t) * 100 + 1)]
         # Step 2: Now predict x0 from the partially denoised sample WITH gradients
         # Convert intermediate_t back to discrete timestep
         final_timestep = th.tensor([int(intermediate_t * self.diffusion.num_timesteps)], device=dist_util.dev())
@@ -681,15 +735,19 @@ class LoRAFinetuneLoop:
         }
 
         # Get predicted x0 for SDS loss computation
-        pred_x0 = self.get_pred_x0(output, final_timestep)
-        pred_x0_denorm = pred_x0 * self.std + self.mean
-        self.human_model.update_rest_attributes(pred_x0_denorm[0])
         pose = self.poses[th.randint(0,self.poses.shape[0], (1,))[0]]
         global_orient = pose[:3].view(1, -1)
         body_pose = th.zeros([1, 69], device=dist_util.dev())
         body_pose[0, :63] = pose[3:66]
+        pred_x0 = self.get_pred_x0(output, final_timestep)
+        pred_x0_denorm = pred_x0 * self.std + self.mean
+        self.human_model.update_rest_attributes(pred_x0_denorm[0])
         self.human_model.apply_pose(body_pose=body_pose, global_orient=global_orient)
         pred_x0_denorm = self.human_model.to_x0_denorm()
+
+        denoised_denorm = denoised * self.std + self.mean
+        self.human_model.update_rest_attributes(denoised_denorm[0])
+        denoised_denorm = self.human_model.to_x0_denorm()
 
         # Compute loss using the predicted x0
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
@@ -698,11 +756,12 @@ class LoRAFinetuneLoop:
             guidance_path = os.path.join(s_path, f"{self.step:08d}.png")
             total_loss = self.compute_loss(
                 pred_x0_denorm,
+                denoised_denorm,
                 prompt,
                 save_guidance_path=guidance_path,
             )
         else:
-            total_loss = self.compute_loss(pred_x0_denorm, prompt)
+            total_loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
 
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())

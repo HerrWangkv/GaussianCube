@@ -15,7 +15,7 @@ mpiexec -n 4 python finetune_vehicle.py \
     --config configs/finetune_vehicle.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
-    --max_steps 50000 \
+    --max_steps 10000 \
     --use_fp16 \
     --use_tensorboard \
     --prompt_file vehicle_prompts.txt \

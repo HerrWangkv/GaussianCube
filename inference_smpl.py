@@ -115,11 +115,12 @@ def main():
     print("Loaded ckpt: ", ckpt)
 
     # Add LoRA support
-    print(f"Applying LoRA weights from {args.lora_checkpoint}")
-    model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
-    model.load_lora_weights(args.lora_checkpoint)
-    model.eval()
-    model.to(dist_util.dev())
+    if args.lora_checkpoint is not None:
+        print(f"Applying LoRA weights from {args.lora_checkpoint}")
+        model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
+        model.load_lora_weights(args.lora_checkpoint)
+        model.eval()
+        model.to(dist_util.dev())
 
     logger.configure(args.exp_name)
     options = logger.args_to_dict(args)

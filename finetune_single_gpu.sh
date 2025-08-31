@@ -10,7 +10,7 @@ python finetune_smpl.py \
     --config configs/finetune_smpl.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
-    --max_steps 50000 \
+    --max_steps 10000 \
     --image_save_interval 1 \
     --use_fp16 \
     --use_tensorboard \
