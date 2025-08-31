@@ -3,10 +3,7 @@ import torch
 from scipy.spatial.transform import Rotation as R
 import smplx
 import math
-from functools import lru_cache
 
-
-@lru_cache(maxsize=None)
 def recursive_unique_assignment(
     splats,
     references,
@@ -139,7 +136,6 @@ def compute_vertex_normals(vertices_np, faces_np):
     return normals
 
 
-@lru_cache(maxsize=None)
 def build_vertex_gaussians(vertices_np, faces_np, min_scale=0.002, max_scale=0.05, device="cuda"):
     V = vertices_np.shape[0]
     # adjacency for average edge length

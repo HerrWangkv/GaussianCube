@@ -3,15 +3,19 @@
 # Based on the original training command from README.md
 
 # Run LoRA fine-tuning with the same distributed setup as original training
+echo "Starting LoRA fine-tuning on Objaverse dataset..."
+echo "Using 4 GPUs with MPI..."
+
+# Set NCCL environment variables for better stability in Docker
+export NCCL_P2P_DISABLE=1
 
 # Add proper GPU binding for MPI ranks
-python finetune_smpl.py \
+mpiexec -n 4 python finetune_smpl.py \
     --exp_name ./output/gaussiancube_finetuning_smpl \
     --config configs/finetune_smpl.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
     --max_steps 50000 \
-    --image_save_interval 1 \
     --use_fp16 \
     --use_tensorboard \
     --prompt_file human_prompts.txt \

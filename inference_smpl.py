@@ -12,6 +12,7 @@ from model.unet import UNetModel
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_dims
 from model.smpl import build_vertex_gaussians, recursive_unique_assignment, invert_assignments, SMPLinGaussianCube
+from model.lora_unet import convert_unet_to_lora
 from utils import dist_util, logger
 from utils.script_util import create_gaussian_diffusion, init_volume_grid, build_single_viewpoint_cam
 from dataset.dataset_render import load_data
@@ -91,8 +92,8 @@ def main():
     print("Start inference...")
     args = create_argparser().parse_args()
 
-    model_and_diffusion_config = OmegaConf.load(args.config)
-    print("Model and Diffusion config: ", model_and_diffusion_config)
+    configs = OmegaConf.load(args.config)
+    print("Model and Diffusion config: ", configs)
 
     print(f"Downloading {args.model_name} files from Hugging Face...")
     downloaded_files = download_model_files(args.model_name)
@@ -106,12 +107,19 @@ def main():
     torch.cuda.set_device(dist_util.dev())
     seed_everything(args.seed + dist.get_rank())
 
-    model_and_diffusion_config['model']['precision'] = "32"
-    model = UNetModel(**model_and_diffusion_config['model'])
+    configs["model"]["precision"] = "32"
+    model = UNetModel(**configs["model"])
 
-    diffusion = create_gaussian_diffusion(**model_and_diffusion_config['diffusion'])
+    diffusion = create_gaussian_diffusion(**configs["diffusion"])
     model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
     print("Loaded ckpt: ", ckpt)
+
+    # Add LoRA support
+    print(f"Applying LoRA weights from {args.lora_checkpoint}")
+    model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
+    model.load_lora_weights(args.lora_checkpoint)
+    model.eval()
+    model.to(dist_util.dev())
 
     logger.configure(args.exp_name)
     options = logger.args_to_dict(args)
@@ -168,16 +176,22 @@ def main():
     img_id = 0
     num_batch_per_rank = args.num_samples // dist.get_world_size()
     for _ in range(num_batch_per_rank):
-        
+
         model_kwargs = next(val_data)  
-        image_size = model_and_diffusion_config['model']['image_size']
-        sample_shape = (1, model_and_diffusion_config['model']['in_channels'], image_size, image_size, image_size)
+        image_size = configs["model"]["image_size"]
+        sample_shape = (
+            1,
+            configs["model"]["in_channels"],
+            image_size,
+            image_size,
+            image_size,
+        )
 
         condition =  {"cond_text": text_features}
         model_fn = model_wrapper(
             model,
             noise_schedule,
-            model_type=MODEL_TYPES[model_and_diffusion_config["diffusion"]["predict_type"]],
+            model_type=MODEL_TYPES[configs["diffusion"]["predict_type"]],
             model_kwargs=condition,
         )
         dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type='dpmsolver++', correcting_xt_fn=correcting_xt_fn)
@@ -209,7 +223,7 @@ def main():
                     #     continue
                     cam = build_single_viewpoint_cam(cam_info, 0)
                     res = render(cam, new_samples_denorm, std_volume, bg_color, args.active_sh_degree)
-                    
+
                     s_path = os.path.join(logger.get_dir(), 'render_images')
                     os.makedirs(s_path,exist_ok=True)
                     output_image = res["render"].clamp(0.0, 1.0)
@@ -227,7 +241,7 @@ def main():
 
         img_id += 1
 
- 
+
 def create_argparser():
     parser = argparse.ArgumentParser()
     # Experiment args
@@ -237,7 +251,7 @@ def create_argparser():
     parser.add_argument("--exp_name", type=str, default="tmp/smpl_vanilla")
     parser.add_argument("--seed", type=int, default=0)
     # Model config
-    parser.add_argument("--config", type=str, default="configs/objaverse_text_cond.yml")
+    parser.add_argument("--config", type=str, default="configs/finetune_smpl.yml")
     # Data args
     parser.add_argument("--active_sh_degree", type=int, default=0)
     # Inference args
@@ -247,7 +261,13 @@ def create_argparser():
     parser.add_argument("--rescale_timesteps", type=int, default=100)
     parser.add_argument("--render_video", action="store_true")
     parser.add_argument("--text", type=str, default="A human.")
- 
+    parser.add_argument(
+        "--lora_checkpoint",
+        type=str,
+        default=None,
+        help="Path to LoRA checkpoint to apply (optional)",
+    )
+
     return parser
 
 
