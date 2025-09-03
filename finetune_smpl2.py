@@ -209,6 +209,7 @@ class LoRAFinetuneLoop:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
+            guidance_scale: guidance scale
             prompt_file: File containing training prompts
             timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
@@ -276,7 +277,7 @@ class LoRAFinetuneLoop:
         self.min_cam_radius, self.max_cam_radius = cam_radius_range
 
         # Initialize Stable Diffusion for SDS
-        print(f"Initializing Stable Diffusion for guidance...")
+        print(f"Initializing Stable Diffusion XL Refiner for guidance...")
         self.refiner = StableDiffusionXLRefiner(
             device=dist_util.dev(),
             fp16=use_fp16,

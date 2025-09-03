@@ -222,13 +222,22 @@ def main():
                     # if pose_id % len(model_kwargs["cams"]) != i:
                     #     continue
                     cam = build_single_viewpoint_cam(cam_info, 0)
-                    openpose_img, _ = smpl_to_openpose(
-                        human_model.splats["joints"],
-                        cam_info["full_proj_transform"].squeeze(),
-                        int(cam_info["image_width"]),
-                        int(cam_info["image_height"]),
-                    )
+                    # openpose_img, _ = smpl_to_openpose(
+                    #     human_model.splats["joints"],
+                    #     cam_info["full_proj_transform"].squeeze(),
+                    #     int(cam_info["image_width"]),
+                    #     int(cam_info["image_height"]),
+                    # )
 
+                    # # Save OpenPose image
+                    # Image.fromarray(openpose_img).save(
+                    #     os.path.join(
+                    #         s_path,
+                    #         "rank_{:02}_render_{:06}_pose_{:06}_cam_{:02}_openpose.png".format(
+                    #             dist.get_rank(), img_id, pose_id, i
+                    #         ),
+                    #     )
+                    # )
                     res = render(cam, new_samples_denorm, std_volume, bg_color, args.active_sh_degree)
 
                     s_path = os.path.join(logger.get_dir(), 'render_images')
@@ -239,18 +248,8 @@ def main():
                     rgb_map = (rgb_map.detach().numpy() * 255).astype('uint8')
                     imageio.imwrite(os.path.join(s_path, "rank_{:02}_render_{:06}_pose_{:06}_cam_{:02}.png".format(dist.get_rank(), img_id, pose_id, i)), rgb_map)
 
-                    # Save OpenPose image
-                    Image.fromarray(openpose_img).save(
-                        os.path.join(
-                            s_path,
-                            "rank_{:02}_render_{:06}_pose_{:06}_cam_{:02}_openpose.png".format(
-                                dist.get_rank(), img_id, pose_id, i
-                            ),
-                        )
-                    )
-
                     frames.append(rgb_map)
-                break
+                    break
             if args.render_video:
                 s_path = os.path.join(logger.get_dir(), 'videos')
                 os.makedirs(s_path,exist_ok=True)

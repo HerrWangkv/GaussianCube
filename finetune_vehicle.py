@@ -188,7 +188,7 @@ class LoRAFinetuneLoop:
         fovx_range=(0.8, 1.2),
         cam_radius_range=(1.0, 3.0),
         active_sh_degree=0,
-        white_background=True,
+        white_background=False,
         **kwargs,
     ):
         """
@@ -207,7 +207,6 @@ class LoRAFinetuneLoop:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
-            sd_version: Stable Diffusion version
             guidance_scale: guidance scale
             prompt_file: File containing training prompts
             timestep_range: Range (min, max) for random intermediate timestep selection
@@ -653,8 +652,14 @@ class LoRAFinetuneLoop:
         )  # Shape: [1, seq_len, embed_dim]
 
         # Create model wrapper for inference (put conditioning in model_kwargs)
+        original_model_fn = model_wrapper(
+            self.original_ddp_model,
+            self.noise_schedule,
+            model_type="x_start",
+            model_kwargs={"cond_text": clip_text_embeds},
+        )
         model_fn = model_wrapper(
-            self.original_ddp_model,  # Use DDP model consistently
+            self.ddp_model,
             self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
@@ -662,17 +667,21 @@ class LoRAFinetuneLoop:
 
         # Step 1: Run partial inference WITHOUT gradients to get partially denoised sample
         with th.no_grad():
+            original_dpm_solver = DPM_Solver(
+                original_model_fn,
+                self.noise_schedule,
+                algorithm_type="dpmsolver++",
+            )
             dpm_solver = DPM_Solver(
-                model_fn, self.noise_schedule, algorithm_type="dpmsolver++"
+                model_fn,
+                self.noise_schedule,
+                algorithm_type="dpmsolver++",
             )
 
             # Run inference from t=1.0 to some intermediate point
             # This gives us a partially denoised sample
             # Lower values = more denoised (less noise), Higher values = more noisy
-            intermediate_t = np.random.uniform(
-                *self.timestep_range
-            )  # Random intermediate timestep
-            denoised, intermediates = dpm_solver.sample(
+            denoised = original_dpm_solver.sample(
                 x=noise,
                 steps=100,
                 t_start=1.0,
@@ -680,9 +689,19 @@ class LoRAFinetuneLoop:
                 order=2,
                 skip_type="time_uniform",
                 method="multistep",
-                return_intermediate=True,
             )
-            partially_denoised = intermediates[int((1 - intermediate_t) * 100 + 1)]
+            intermediate_t = np.random.uniform(
+                *self.timestep_range
+            )  # Random intermediate timestep
+            partially_denoised = dpm_solver.sample(
+                x=noise,
+                steps=100,
+                t_start=1.0,
+                t_end=intermediate_t,
+                order=2,
+                skip_type="time_uniform",
+                method="multistep",
+            )
 
         # Step 2: Now predict x0 from the partially denoised sample WITH gradients
         # Convert intermediate_t back to discrete timestep
