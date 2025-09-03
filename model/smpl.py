@@ -3,6 +3,7 @@ import torch
 from scipy.spatial.transform import Rotation as R
 import smplx
 import math
+import cv2
 
 def recursive_unique_assignment(
     splats,
@@ -240,6 +241,200 @@ def quaternion_normalize(quaternions):
     norms = torch.norm(quaternions, dim=-1, keepdim=True)
     return quaternions / norms
 
+SMPL_TO_BODY_MAPPING = [
+    24,  # Nose
+    12,  # Neck
+    16,  # RShoulder
+    18,  # RElbow
+    20,  # RWrist
+    17,  # LShoulder
+    19,  # LElbow
+    21,  # LWrist
+    # 0, # Pelvis
+    1,  # RHip
+    4,  # RKnee
+    7,  # RAnkle
+    2,  # LHip
+    5,  # LKnee
+    8,  # LAnkle
+    26,  # LEye
+    25,  # REye
+    28,  # LEar
+    27,  # REar
+]
+
+# OpenPose Body connection pairs for skeleton drawing
+BODY_PAIRS = [
+    [2, 3],
+    [2, 6],
+    [3, 4],
+    [4, 5],
+    [6, 7],
+    [7, 8],
+    [2, 9],
+    [9, 10],
+    [10, 11],
+    [2, 12],
+    [12, 13],
+    [13, 14],
+    [2, 1],
+    [1, 15],
+    [15, 17],
+    [1, 16],
+    [16, 18],
+]
+BODY_COLORS = [
+    [255, 0, 0],
+    [255, 85, 0],
+    [255, 170, 0],
+    [255, 255, 0],
+    [170, 255, 0],
+    [85, 255, 0],
+    [0, 255, 0],
+    [0, 255, 85],
+    [0, 255, 170],
+    [0, 255, 255],
+    [0, 170, 255],
+    [0, 85, 255],
+    [0, 0, 255],
+    [85, 0, 255],
+    [170, 0, 255],
+    [255, 0, 255],
+    [255, 0, 170],
+    [255, 0, 85],
+]
+
+
+def convert_smpl_to_body(smpl_joints):
+    """
+    Convert SMPL joints (45,3) to OpenPose Body format (18,3)
+
+    Args:
+        smpl_joints: numpy array of shape (45, 3) - SMPL joint positions
+
+    Returns:
+        body_joints: numpy array of shape (18, 3) - Body joint positions
+    """
+    # Initialize Body joints with NaN (missing joints)
+    body_joints = smpl_joints[SMPL_TO_BODY_MAPPING]
+    return body_joints
+
+
+def determine_valid_joint_based_on_ndc(joints_ndc):
+    """
+    Determine self-occluded joints based on NDC z-values heuristically.
+    Joints are indexed as:
+    [0]Nose, [1]Neck, [2]RShoulder, [3]RElbow, [4]RWrist,
+    [5]LShoulder, [6]LElbow, [7]LWrist,
+    [8]RHip, [9]RKnee, [10]RAnkle,
+    [11]LHip, [12]LKnee, [13]LAnkle,
+    [14]LEye, [15]REye, [16]LEar, [17]REar
+    """
+    visible = np.ones(len(joints_ndc), dtype=bool)
+    z = joints_ndc[:, 2]
+
+    # Reference points
+    neck_z = z[1]
+    nose_z = z[0]
+
+    # --- Face ---
+    eye_mean_z = 1 / 2 * (z[14] + z[15])
+    if eye_mean_z < nose_z:
+        visible[14] = False  # LEye
+        visible[15] = False  # REye
+        visible[0] = False
+    if z[16] < neck_z and neck_z < z[17]:
+        visible[17] = False  # REar
+    elif z[17] < neck_z and neck_z < z[16]:
+        visible[16] = False  # LEar
+
+    # --- Arms ---
+    if z[2] < neck_z and neck_z < z[5]:
+        if z[3] < neck_z and neck_z < z[6]:
+            if z[4] < z[7]:
+                visible[5] = False
+                visible[6] = False
+                visible[7] = False
+    elif z[5] < neck_z and neck_z < z[2]:
+        if z[6] < neck_z and neck_z < z[3]:
+            if z[7] < z[4]:
+                visible[2] = False
+                visible[3] = False
+                visible[4] = False
+
+    return visible
+
+
+def smpl_to_openpose(
+    smpl_joints,
+    full_proj_transform,
+    image_width,
+    image_height,
+    draw_skeleton=True,
+):
+    """
+    Convert SMPL joints to OpenPose v2 Body format with size-dependent thickness.
+    """
+
+    # Convert inputs to numpy
+    if isinstance(smpl_joints, torch.Tensor):
+        smpl_joints = smpl_joints.detach().cpu().numpy()
+    if isinstance(full_proj_transform, torch.Tensor):
+        full_proj_transform = full_proj_transform.detach().cpu().numpy()
+    full_proj_transform = full_proj_transform.squeeze()
+
+    # SMPL -> Body
+    body_3d = convert_smpl_to_body(smpl_joints)
+
+    # Project to 2D
+    joints_h = np.concatenate([body_3d, np.ones((len(body_3d), 1))], axis=1)
+    proj = joints_h @ full_proj_transform
+    w_coords = np.where(np.abs(proj[:, 3:4]) < 1e-8, 1e-8, proj[:, 3:4])
+    joints_ndc = proj[:, :3] / w_coords
+    x_pix = (joints_ndc[:, 0] * 0.5 + 0.5) * image_width
+    y_pix = (joints_ndc[:, 1] * 0.5 + 0.5) * image_height
+
+    x_valid = np.logical_and(x_pix >= 0, x_pix < image_width)
+    y_valid = np.logical_and(y_pix >= 0, y_pix < image_height)
+    visible = np.logical_and(x_valid, y_valid)
+    valid = visible  # np.logical_and(visible, determine_valid_joint_based_on_ndc(joints_ndc))
+    # Full Body 2D coords
+    body_2d = np.stack([x_pix, y_pix], axis=1)
+
+    # Create image
+    img = np.zeros((image_height, image_width, 3), dtype=np.uint8)
+
+    # Draw joints
+    for i, color in enumerate(BODY_COLORS):
+        if valid[i]:
+            pt = body_2d[i].astype(int)
+            cv2.circle(img, tuple(pt), 4, color, -1)
+            # cv2.putText(
+            #     img,
+            #     str(SMPL_TO_BODY_MAPPING[i]),
+            #     (pt[0] + 6, pt[1] - 6),
+            #     cv2.FONT_HERSHEY_SIMPLEX,
+            #     0.5,
+            #     color,
+            #     1,
+            #     cv2.LINE_AA,
+            # )
+    if draw_skeleton:
+        for (i, j), color in zip(BODY_PAIRS, BODY_COLORS):
+            pt1 = body_2d[i - 1].astype(int)
+            pt2 = body_2d[j - 1].astype(int)
+            if valid[i - 1] and valid[j - 1]:
+                mY = np.mean([pt1[0], pt2[0]])
+                mX = np.mean([pt1[1], pt2[1]])
+                length = ((pt1 - pt2) ** 2).sum() ** 0.5
+                angle = math.degrees(math.atan2(pt1[1] - pt2[1], pt1[0] - pt2[0]))
+                polygon = cv2.ellipse2Poly(
+                    (int(mY), int(mX)), (int(length / 2), 4), int(angle), 0, 360, 1
+                )
+                cv2.fillConvexPoly(img, polygon, [int(float(c) * 0.6) for c in color])
+
+    return img, body_2d
+
 
 class SMPL:
     def __init__(
@@ -269,10 +464,10 @@ class SMPL:
                 global_orient=self.global_orient,
                 transl=self.transl,
                 return_verts=True,
-                return_full_pose=True,
                 return_joints=True,
             )
         self.rest_vertices = out.vertices[0].detach().cpu().numpy()  # (6890, 3)
+        self.joints = out.joints[0].detach()
         self.faces = self.model.faces.astype(np.int64)  # (13776, 3)
         self.lbs_weights = self.model.lbs_weights.to(device)  # (6890, 24)
         self.build_initial_vertex_gaussians()
@@ -318,12 +513,12 @@ class SMPL:
                 global_orient=self.global_orient,
                 transl=self.transl,
                 return_verts=True,
-                return_full_pose=True,
                 return_joints=True,
             )
 
         # posed vertex positions (global)
         self.vertices = out.vertices[0].detach().cpu().numpy()  # (V,3)
+        self.joints = out.joints[0].detach()
         self.means, self.scales, self.quats = build_vertex_gaussians(
             self.vertices, self.faces, device=self.device
         )
@@ -338,6 +533,7 @@ class SMPL:
             "opacities": self.opacities,
             "scales": self.scales * ratio,
             "quats": self.quats,
+            "joints": (self.joints - center) * ratio,
             "ratio": ratio,
             "center": center,
         }

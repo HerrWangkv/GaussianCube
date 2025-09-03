@@ -41,8 +41,8 @@ from model.lora_unet import convert_unet_to_lora, LoRAUNetModel
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_dims
 from model.unet import UNetModel
-from model.smpl import SMPLinGaussianCube
-from utils.sd_utils import StableDiffusion
+from model.smpl import SMPLinGaussianCube, smpl_to_openpose
+from utils.refiner_openpose_utils import StableDiffusionXLOpenposeRefiner
 from gaussian_renderer import render
 
 # Initial loss scale for FP16 training
@@ -182,7 +182,6 @@ class LoRAFinetuneLoop:
         lora_exclude_modules=None,
         # Guidance configuration
         timestep_range=(0.3, 0.7),
-        strength=0.7,
         guidance_scale=10.0,
         vram_O=True,
         render_views=4,
@@ -209,8 +208,6 @@ class LoRAFinetuneLoop:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
-            sd_version: Stable Diffusion version
-            guidance_scale: guidance scale
             prompt_file: File containing training prompts
             timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
@@ -272,7 +269,7 @@ class LoRAFinetuneLoop:
         self.guidance_scale = guidance_scale
         self.render_views = render_views
         self.timestep_range = timestep_range
-        self.render_resolution = 512
+        self.render_resolution = 768
 
         # Training state
         self.step = 0
@@ -289,11 +286,10 @@ class LoRAFinetuneLoop:
 
         # Initialize Stable Diffusion for SDS
         print(f"Initializing Stable Diffusion for guidance...")
-        self.refiner = StableDiffusion(
+        self.refiner = StableDiffusionXLOpenposeRefiner(
             device=dist_util.dev(),
             fp16=use_fp16,
             vram_O=vram_O,
-            refiner_strength=strength,
         )
 
         # Initialize CLIP text encoder for GaussianCube diffusion conditioning
@@ -383,14 +379,6 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
-            self.original_ddp_model = DDP(
-                self.original_model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -399,7 +387,6 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
-            self.original_ddp_model = self.original_model
 
         # Loss
         self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
@@ -498,7 +485,6 @@ class LoRAFinetuneLoop:
         """Main training loop."""
         print(f"Starting LoRA fine-tuning with SDXL guidance...")
         print(f"LoRA rank: {self.lora_rank}, alpha: {self.lora_alpha}")
-        print(f"Guidance scale: {self.guidance_scale}")
 
         if dist.get_rank() == 0:
             iterator = trange(
@@ -543,6 +529,36 @@ class LoRAFinetuneLoop:
         offset = np.random.uniform(0, 360)
         azimuth = (np.linspace(0, 360, cam_num, endpoint=False) + offset) % 360
         azimuth = azimuth.astype(np.int32)
+        prompts_cam_pose = []
+        for a in azimuth:
+            if 15 <= a and a < 75:
+                prompts_cam_pose.append(
+                    "body turned slightly right, left side closer to camera"
+                )
+            elif 75 <= a and a < 105:
+                prompts_cam_pose.append(
+                    "showing the subject's left side of the face and body"
+                )
+            elif 105 <= a and a < 165:
+                prompts_cam_pose.append(
+                    "back is visible but angled, left side still a bit visible"
+                )
+            elif 165 <= a and a < 195:
+                prompts_cam_pose.append("fully facing away, back toward camera.")
+            elif 195 <= a and a < 255:
+                prompts_cam_pose.append(
+                    "back is visible but angled, right side still a bit visible"
+                )
+            elif 255 <= a and a < 285:
+                prompts_cam_pose.append(
+                    "showing the subject's right side of the face and body"
+                )
+            elif 285 <= a and a < 345:
+                prompts_cam_pose.append(
+                    "body turned slightly left, right side closer to camera"
+                )
+            else:
+                prompts_cam_pose.append("facing the camera")
         elevation = np.random.randint(self.min_elevation, self.max_elevation, cam_num).astype(np.int32)
         cam_radius = np.random.uniform(self.min_cam_radius, self.max_cam_radius, cam_num).astype(np.float32)
         fovx = np.random.uniform(self.min_fovx, self.max_fovx, cam_num).astype(np.float32)
@@ -572,54 +588,60 @@ class LoRAFinetuneLoop:
                         cams[k] = th.cat([cams[k], new_tensor], dim=0)
                     else:
                         cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
+            cams["cam_prompt"] = prompts_cam_pose
         return cams
 
-    def generate_sds_camera_views(self, pred_x0_denorm, denoised_denorm):
+    def generate_sds_camera_views(self, pred_x0_denorm):
         """Generate camera views for SDS loss computation."""
         predicted_rendered_images = []
-        denoised_rendered_images = []
-
+        cond_images = []
         # Generate multiple camera viewpoints
         cams = self.load_random_cams(self.render_views)
+        cam_prompts = cams.pop("cam_prompt")
         for view_idx in range(self.render_views):
             cam = build_single_viewpoint_cam(cams, view_idx)
+            openpose_img, _ = smpl_to_openpose(
+                self.human_model.splats["joints"],
+                cams["full_proj_transform"][view_idx].squeeze(),
+                int(cams["image_width"][view_idx]),
+                int(cams["image_height"][view_idx]),
+            )
+            cond_images.append(
+                th.from_numpy(np.array(openpose_img))
+                .to(dist_util.dev())
+                .permute(2, 0, 1)
+                .to(th.float32)
+                / 255.0
+            )
             res = render(cam, pred_x0_denorm, self.std_volume, self.bg_color, self.active_sh_degree)
             predicted_rendered_images.append(res["render"])
-            res = render(
-                cam,
-                denoised_denorm,
-                self.std_volume,
-                self.bg_color,
-                self.active_sh_degree,
-            )
-            denoised_rendered_images.append(res["render"])
-
-        return th.stack(predicted_rendered_images, dim=0), th.stack(
-            denoised_rendered_images, dim=0
-        )  # [views, 3, H, W]
+        return (
+            th.stack(predicted_rendered_images, dim=0),
+            th.stack(cond_images, dim=0),
+            cam_prompts,
+        )
 
     @ignore_stderr
-    def compute_loss(
-        self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None
-    ):
+    def compute_loss(self, pred_x0_denorm, prompt, save_guidance_path=None):
         """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
         Also computes reference output using the original (non-LoRA) model without gradients.
         """
         # Generate multiple camera views of the 3D object (LoRA model)
-        predicted_rendered_views, denoised_rendered_views = (
-            self.generate_sds_camera_views(pred_x0_denorm, denoised_denorm)
+        predicted_rendered_views, cond_images, cam_prompts = (
+            self.generate_sds_camera_views(pred_x0_denorm)
         )
         refined_tensors = self.refiner.refine_images(
-            images=denoised_rendered_views,
-            prompts=[prompt] * self.render_views,
+            cond_images=cond_images,
+            prompts=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
             negative_prompts=[""] * self.render_views,
             guidance_scale=self.guidance_scale,
+            output_type="pt",
         )
         if save_guidance_path:
             # Save rendered views and refined images side by side for visualization
             # Each row: [rendered_view | refined_image]
             predicted_rendered_np = predicted_rendered_views.detach().cpu().numpy()
-            denoised_rendered_np = denoised_rendered_views.detach().cpu().numpy()
+            cond_images_np = cond_images.detach().cpu().numpy()
             refined_np = refined_tensors.detach().cpu().numpy()
             rows = []
             for i in range(predicted_rendered_np.shape[0]):
@@ -627,14 +649,14 @@ class LoRAFinetuneLoop:
                 predicted_rendered_img = (
                     np.clip(predicted_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
                 ).astype(np.uint8)
-                denoised_rendered_img = (
-                    np.clip(denoised_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                cond_img = (
+                    np.clip(cond_images_np[i].transpose(1, 2, 0), 0, 1) * 255
                 ).astype(np.uint8)
                 refined_img = (
                     np.clip(refined_np[i].transpose(1, 2, 0), 0, 1) * 255
                 ).astype(np.uint8)
                 row = np.concatenate(
-                    [predicted_rendered_img, denoised_rendered_img, refined_img], axis=1
+                    [predicted_rendered_img, cond_img, refined_img], axis=1
                 )
                 rows.append(row)
             # Stack all rows vertically
@@ -667,7 +689,7 @@ class LoRAFinetuneLoop:
 
         # Create model wrapper for inference (put conditioning in model_kwargs)
         model_fn = model_wrapper(
-            self.original_ddp_model,  # Use DDP model consistently
+            self.ddp_model,  # Use DDP model consistently
             self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
@@ -698,17 +720,15 @@ class LoRAFinetuneLoop:
             intermediate_t = np.random.uniform(
                 *self.timestep_range
             )  # Random intermediate timestep
-            denoised, intermediates = dpm_solver.sample(
+            partially_denoised = dpm_solver.sample(
                 x=noise,
                 steps=100,
                 t_start=1.0,
-                t_end=1.0 / self.diffusion.num_timesteps,
+                t_end=intermediate_t,
                 order=2,
                 skip_type="time_uniform",
                 method="multistep",
-                return_intermediate=True,
             )
-            partially_denoised = intermediates[int((1 - intermediate_t) * 100 + 1)]
         # Step 2: Now predict x0 from the partially denoised sample WITH gradients
         # Convert intermediate_t back to discrete timestep
         final_timestep = th.tensor([int(intermediate_t * self.diffusion.num_timesteps)], device=dist_util.dev())
@@ -745,10 +765,6 @@ class LoRAFinetuneLoop:
         self.human_model.apply_pose(body_pose=body_pose, global_orient=global_orient)
         pred_x0_denorm = self.human_model.to_x0_denorm()
 
-        denoised_denorm = denoised * self.std + self.mean
-        self.human_model.update_rest_attributes(denoised_denorm[0])
-        denoised_denorm = self.human_model.to_x0_denorm()
-
         # Compute loss using the predicted x0
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
             s_path = os.path.join(logger.get_dir(), "images")
@@ -756,12 +772,11 @@ class LoRAFinetuneLoop:
             guidance_path = os.path.join(s_path, f"{self.step:08d}.png")
             total_loss = self.compute_loss(
                 pred_x0_denorm,
-                denoised_denorm,
                 prompt,
                 save_guidance_path=guidance_path,
             )
         else:
-            total_loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
+            total_loss = self.compute_loss(pred_x0_denorm, prompt)
 
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
@@ -964,12 +979,6 @@ def find_resume_checkpoint(resume_checkpoint):
             return None
         return max(files,key=parse_resume_step_from_filename)
     return resume_checkpoint
-
-
-def build_single_viewpoint_cam(cam_dict, idx):
-    """Build single viewpoint camera."""
-    cam = {k: v[idx].to(dist_util.dev()).contiguous() for k, v in cam_dict.items()}
-    return cam
 
 
 def find_ema_checkpoint(main_checkpoint, step, rate):

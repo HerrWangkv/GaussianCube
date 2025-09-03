@@ -11,7 +11,7 @@ from huggingface_hub import hf_hub_download
 from model.unet import UNetModel
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_dims
-from model.smpl import build_vertex_gaussians, recursive_unique_assignment, invert_assignments, SMPLinGaussianCube
+from model.smpl import SMPLinGaussianCube, smpl_to_openpose
 from model.lora_unet import convert_unet_to_lora
 from utils import dist_util, logger
 from utils.script_util import create_gaussian_diffusion, init_volume_grid, build_single_viewpoint_cam
@@ -19,8 +19,7 @@ from dataset.dataset_render import load_data
 from gaussian_renderer import render
 import imageio
 from tqdm import tqdm
-import math
-import smplx
+from PIL import Image
 
 
 MODEL_TYPES = {
@@ -223,6 +222,13 @@ def main():
                     # if pose_id % len(model_kwargs["cams"]) != i:
                     #     continue
                     cam = build_single_viewpoint_cam(cam_info, 0)
+                    openpose_img, _ = smpl_to_openpose(
+                        human_model.splats["joints"],
+                        cam_info["full_proj_transform"].squeeze(),
+                        int(cam_info["image_width"]),
+                        int(cam_info["image_height"]),
+                    )
+
                     res = render(cam, new_samples_denorm, std_volume, bg_color, args.active_sh_degree)
 
                     s_path = os.path.join(logger.get_dir(), 'render_images')
@@ -233,8 +239,18 @@ def main():
                     rgb_map = (rgb_map.detach().numpy() * 255).astype('uint8')
                     imageio.imwrite(os.path.join(s_path, "rank_{:02}_render_{:06}_pose_{:06}_cam_{:02}.png".format(dist.get_rank(), img_id, pose_id, i)), rgb_map)
 
+                    # Save OpenPose image
+                    Image.fromarray(openpose_img).save(
+                        os.path.join(
+                            s_path,
+                            "rank_{:02}_render_{:06}_pose_{:06}_cam_{:02}_openpose.png".format(
+                                dist.get_rank(), img_id, pose_id, i
+                            ),
+                        )
+                    )
+
                     frames.append(rgb_map)
-                    break
+                break
             if args.render_video:
                 s_path = os.path.join(logger.get_dir(), 'videos')
                 os.makedirs(s_path,exist_ok=True)

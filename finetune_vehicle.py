@@ -930,12 +930,6 @@ def find_resume_checkpoint(resume_checkpoint):
     return resume_checkpoint
 
 
-def build_single_viewpoint_cam(cam_dict, idx):
-    """Build single viewpoint camera."""
-    cam = {k: v[idx].to(dist_util.dev()).contiguous() for k, v in cam_dict.items()}
-    return cam
-
-
 def find_ema_checkpoint(main_checkpoint, step, rate):
     """Find EMA checkpoint."""
     if main_checkpoint is None:

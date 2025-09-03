@@ -55,9 +55,8 @@ lora:
 
 # Guidance Configuration
 guidance:
-  timestep_range: [0.3, 0.7]
-  strength: 0.7
-  guidance_scale: 10.0
+  timestep_range: [0.001, 1.0]
+  guidance_scale: 5.0
   vram_O: false                # Memory optimization
   render_views: 6
   elevation_range: [-10, 10]
