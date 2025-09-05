@@ -216,7 +216,7 @@ class LoRAFinetuneLoop:
             ... (other parameters similar to TrainLoop)
         """
         # Store original model reference
-        self.original_model = model
+        self.ema_model = model
         # Create a LoRA model with the same weights as the original model
         self.lora_model = copy.deepcopy(model)
         self.model = self.lora_model
@@ -372,8 +372,8 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
-            self.original_ddp_model = DDP(
-                self.original_model,
+            self.ema_ddp_model = DDP(
+                self.ema_model,
                 device_ids=[dist_util.dev()],
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
@@ -388,7 +388,7 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
-            self.original_ddp_model = self.original_model
+            self.ema_ddp_model = self.ema_model
 
         # Loss
         self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
@@ -630,7 +630,7 @@ class LoRAFinetuneLoop:
     @ignore_stderr
     def compute_loss(self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None):
         """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
-        Also computes reference output using the original (non-LoRA) model without gradients.
+        Also computes reference output using the ema (non-LoRA) model without gradients.
         """
         # Generate multiple camera views of the 3D object (LoRA model)
         predicted_rendered_views, denoised_rendered_views, cam_prompts = (
@@ -698,8 +698,8 @@ class LoRAFinetuneLoop:
         )  # Shape: [1, seq_len, embed_dim]
 
         # Create model wrapper for inference (put conditioning in model_kwargs)
-        original_model_fn = model_wrapper(
-            self.original_ddp_model,  # Use DDP model consistently
+        ema_model_fn = model_wrapper(
+            self.ema_ddp_model,  # Use DDP model consistently
             self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
@@ -726,8 +726,11 @@ class LoRAFinetuneLoop:
             return xt_new
         # Step 1: Run partial inference WITHOUT gradients to get partially denoised sample
         with th.no_grad():
-            original_dpm_solver = DPM_Solver(
-                original_model_fn, self.noise_schedule, algorithm_type="dpmsolver++", correcting_xt_fn=correcting_xt_fn
+            ema_dpm_solver = DPM_Solver(
+                ema_model_fn,
+                self.noise_schedule,
+                algorithm_type="dpmsolver++",
+                correcting_xt_fn=correcting_xt_fn,
             )
             dpm_solver = DPM_Solver(
                 model_fn, self.noise_schedule, algorithm_type="dpmsolver++", correcting_xt_fn=correcting_xt_fn
@@ -736,7 +739,7 @@ class LoRAFinetuneLoop:
             # Run inference from t=1.0 to some intermediate point
             # This gives us a partially denoised sample
             # Lower values = more denoised (less noise), Higher values = more noisy
-            denoised = original_dpm_solver.sample(
+            denoised = ema_dpm_solver.sample(
                 x=noise,
                 steps=100,
                 t_start=1.0,
@@ -854,6 +857,10 @@ class LoRAFinetuneLoop:
 
         for rate, params in zip(self.ema_rate, self.ema_params):
             update_ema(params, self.master_params, rate=rate)
+        # Update EMA model parameters
+        if self.ema_params:
+            self._update_ema_model_params(self.ema_params[0])
+
         master_params_to_model_params(self.model_params, self.master_params)
         self.lg_loss_scale += self.fp16_scale_growth
 
@@ -872,6 +879,10 @@ class LoRAFinetuneLoop:
         for rate, params in zip(self.ema_rate, self.ema_params):
             update_ema(params, self.master_params, rate=rate)
 
+        # Update EMA model parameters
+        if self.ema_params:
+            self._update_ema_model_params(self.ema_params[0])
+
     def _log_grad_norm(self):
         """Log gradient norms."""
         sqsum = 0.0
@@ -883,6 +894,25 @@ class LoRAFinetuneLoop:
     def _anneal_lr(self):
         """Learning rate annealing (placeholder)."""
         return
+
+    def _update_ema_model_params(self, ema_params):
+        """Update the EMA model's LoRA parameters with the latest EMA parameters."""
+        if self.use_fp16:
+            # Convert master params to model params for FP16
+            ema_model_params = unflatten_master_params(self.model_params, ema_params)
+        else:
+            ema_model_params = ema_params
+        # Update EMA model's LoRA parameters only
+        param_idx = 0
+        for name, param in self.ema_model.named_parameters():
+            # Only update LoRA parameters
+            if any(
+                param is lora_param
+                for lora_param in self.ema_model.get_lora_parameters()
+            ):
+                if param_idx < len(ema_model_params):
+                    param.data.copy_(ema_model_params[param_idx].data)
+                    param_idx += 1
 
     def log_step(self):
         """Log step information."""
