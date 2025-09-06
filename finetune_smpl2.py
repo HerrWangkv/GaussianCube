@@ -270,7 +270,11 @@ class LoRAFinetuneLoop:
 
         # Rendering configuration
         self.active_sh_degree = active_sh_degree
-        self.bg_color = th.tensor([1,1,1]).to(th.float32).to(dist_util.dev()) if white_background else th.tensor([0,0,0]).to(th.float32).to(dist_util.dev())
+        self.bg_color = (
+            th.tensor([1, 1, 1]).to(th.float32).to(dist_util.dev())
+            if white_background
+            else None
+        )
         self.std_volume = th.tensor(init_volume_grid(bound=bound, num_pts_each_axis=num_pts_each_axis)).to(th.float32).to(dist_util.dev()).contiguous()
         self.min_elevation, self.max_elevation = elevation_range
         self.min_fovx, self.max_fovx = fovx_range
@@ -617,9 +621,18 @@ class LoRAFinetuneLoop:
             #     .to(th.float32)
             #     / 255.0
             # )
-            res = render(cam, pred_x0_denorm, self.std_volume, self.bg_color, self.active_sh_degree)
+            bg_color = (
+                self.bg_color
+                if self.bg_color is not None
+                else th.rand(3).to(th.float32).to(dist_util.dev())
+            )
+            res = render(
+                cam, pred_x0_denorm, self.std_volume, bg_color, self.active_sh_degree
+            )
             predicted_rendered_images.append(res["render"])
-            res = render(cam, denoised_denorm, self.std_volume, self.bg_color, self.active_sh_degree)
+            res = render(
+                cam, denoised_denorm, self.std_volume, bg_color, self.active_sh_degree
+            )
             denoised_rendered_images.append(res["render"])
         return (
             th.stack(predicted_rendered_images, dim=0),
