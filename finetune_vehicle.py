@@ -226,13 +226,22 @@ class LoRAFinetuneLoop:
         )
 
         # Store original model reference
-        self.original_model = model
+        self.ema_model = convert_unet_to_lora(
+            model,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            lora_target_modules=lora_target_modules,
+            lora_exclude_modules=lora_exclude_modules,
+            **kwargs,
+        )
         self.model = self.lora_model
         self.diffusion = diffusion
 
         # Move LoRA model to device (important for distributed training)
         print(f"Moving LoRA model to device: {dist_util.dev()}")
         self.model.to(dist_util.dev())
+        self.ema_model.to(dist_util.dev())
 
         # Training configuration
         if batch_size != 1:
@@ -278,7 +287,11 @@ class LoRAFinetuneLoop:
 
         # Rendering configuration
         self.active_sh_degree = active_sh_degree
-        self.bg_color = th.tensor([1,1,1]).to(th.float32).to(dist_util.dev()) if white_background else th.tensor([0,0,0]).to(th.float32).to(dist_util.dev())
+        self.bg_color = (
+            th.tensor([1, 1, 1]).to(th.float32).to(dist_util.dev())
+            if white_background
+            else None
+        )
         self.std_volume = th.tensor(init_volume_grid(bound=bound, num_pts_each_axis=num_pts_each_axis)).to(th.float32).to(dist_util.dev()).contiguous()
         self.min_elevation, self.max_elevation = elevation_range
         self.min_fovx, self.max_fovx = fovx_range
@@ -371,8 +384,8 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
-            self.original_ddp_model = DDP(
-                self.original_model,
+            self.ema_ddp_model = DDP(
+                self.ema_model,
                 device_ids=[dist_util.dev()],
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
@@ -387,7 +400,7 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
-            self.original_ddp_model = self.original_model
+            self.ema_ddp_model = self.ema_model
 
         # Loss
         self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
@@ -562,13 +575,20 @@ class LoRAFinetuneLoop:
         cams = self.load_random_cams(self.render_views)
         for view_idx in range(self.render_views):
             cam = build_single_viewpoint_cam(cams, view_idx)
-            res = render(cam, pred_x0_denorm[0], self.std_volume, self.bg_color, self.active_sh_degree)
+            bg_color = (
+                self.bg_color
+                if self.bg_color is not None
+                else th.rand(3).to(th.float32).to(dist_util.dev())
+            )
+            res = render(
+                cam, pred_x0_denorm[0], self.std_volume, bg_color, self.active_sh_degree
+            )
             predicted_rendered_images.append(res["render"])
             res = render(
                 cam,
                 denoised_denorm[0],
                 self.std_volume,
-                self.bg_color,
+                bg_color,
                 self.active_sh_degree,
             )
             denoised_rendered_images.append(res["render"])
@@ -582,7 +602,7 @@ class LoRAFinetuneLoop:
         self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None
     ):
         """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
-        Also computes reference output using the original (non-LoRA) model without gradients.
+        Also computes reference output using the ema (non-LoRA) model without gradients.
         """
         # Generate multiple camera views of the 3D object (LoRA model)
         predicted_rendered_views, denoised_rendered_views = (
@@ -652,8 +672,8 @@ class LoRAFinetuneLoop:
         )  # Shape: [1, seq_len, embed_dim]
 
         # Create model wrapper for inference (put conditioning in model_kwargs)
-        original_model_fn = model_wrapper(
-            self.original_ddp_model,
+        ema_model_fn = model_wrapper(
+            self.ema_ddp_model,
             self.noise_schedule,
             model_type="x_start",
             model_kwargs={"cond_text": clip_text_embeds},
@@ -667,8 +687,8 @@ class LoRAFinetuneLoop:
 
         # Step 1: Run partial inference WITHOUT gradients to get partially denoised sample
         with th.no_grad():
-            original_dpm_solver = DPM_Solver(
-                original_model_fn,
+            ema_dpm_solver = DPM_Solver(
+                ema_model_fn,
                 self.noise_schedule,
                 algorithm_type="dpmsolver++",
             )
@@ -681,7 +701,7 @@ class LoRAFinetuneLoop:
             # Run inference from t=1.0 to some intermediate point
             # This gives us a partially denoised sample
             # Lower values = more denoised (less noise), Higher values = more noisy
-            denoised = original_dpm_solver.sample(
+            denoised = ema_dpm_solver.sample(
                 x=noise,
                 steps=100,
                 t_start=1.0,
@@ -790,6 +810,9 @@ class LoRAFinetuneLoop:
 
         for rate, params in zip(self.ema_rate, self.ema_params):
             update_ema(params, self.master_params, rate=rate)
+        # Update EMA model parameters
+        if self.ema_params:
+            self._update_ema_model_params(self.ema_params[0])
         master_params_to_model_params(self.model_params, self.master_params)
         self.lg_loss_scale += self.fp16_scale_growth
 
@@ -807,6 +830,28 @@ class LoRAFinetuneLoop:
 
         for rate, params in zip(self.ema_rate, self.ema_params):
             update_ema(params, self.master_params, rate=rate)
+        # Update EMA model parameters
+        if self.ema_params:
+            self._update_ema_model_params(self.ema_params[0])
+
+    def _update_ema_model_params(self, ema_params):
+        """Update the EMA model's LoRA parameters with the latest EMA parameters."""
+        if self.use_fp16:
+            # Convert master params to model params for FP16
+            ema_model_params = unflatten_master_params(self.model_params, ema_params)
+        else:
+            ema_model_params = ema_params
+        # Update EMA model's LoRA parameters only
+        param_idx = 0
+        for name, param in self.ema_model.named_parameters():
+            # Only update LoRA parameters
+            if any(
+                param is lora_param
+                for lora_param in self.ema_model.get_lora_parameters()
+            ):
+                if param_idx < len(ema_model_params):
+                    param.data.copy_(ema_model_params[param_idx].data)
+                    param_idx += 1
 
     def _log_grad_norm(self):
         """Log gradient norms."""
