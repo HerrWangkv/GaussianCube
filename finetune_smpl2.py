@@ -596,6 +596,27 @@ class LoRAFinetuneLoop:
                     else:
                         cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
             cams["cam_prompt"] = prompts_cam_pose
+        face_cam_pose = orbit_camera(
+            0,
+            np.random.uniform(300, 420) % 360,
+            radius=0.5,
+            target=np.array([0, 0.4, 0], dtype=np.float32),
+            opengl=True,
+        )
+        face_cam_pose = convert_mat @ face_cam_pose
+        face_cam = load_cam(
+            c2w=face_cam_pose, orig_image_size=self.render_resolution, fovx=1.0
+        )
+        for k, v in face_cam.items():
+            if not isinstance(v, th.Tensor):
+                if isinstance(v, np.ndarray):
+                    new_tensor = th.from_numpy(np.array([v]))
+                else:
+                    new_tensor = th.tensor([v])
+                cams[k] = th.cat([cams[k], new_tensor], dim=0)
+            else:
+                cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
+        cams["cam_prompt"].append("face only")
         return cams
 
     def generate_sds_camera_views(self, pred_x0_denorm, denoised_denorm):
@@ -606,7 +627,7 @@ class LoRAFinetuneLoop:
         # Generate multiple camera viewpoints
         cams = self.load_random_cams(self.render_views)
         cam_prompts = cams.pop("cam_prompt")
-        for view_idx in range(self.render_views):
+        for view_idx in range(self.render_views + 1):
             cam = build_single_viewpoint_cam(cams, view_idx)
             # openpose_img, _ = smpl_to_openpose(
             #     self.human_model.splats["joints"],
@@ -652,7 +673,7 @@ class LoRAFinetuneLoop:
         refined_output = self.refiner.refine_images(
             images=denoised_rendered_views,
             prompt=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
-            negative_prompt=[""] * self.render_views,
+            negative_prompt=[""] * len(cam_prompts),
             guidance_scale=self.guidance_scale,
             output_type="pt",
         )
@@ -825,7 +846,6 @@ class LoRAFinetuneLoop:
             )
         else:
             total_loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
-
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
         logger.logkv(
