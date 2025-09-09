@@ -24,7 +24,7 @@ mpiexec -n 4 python finetune_vehicle.py \
     --use_fp16 \
     --use_tensorboard \
     --prompt_file vehicle_prompts.txt \
-    --resume_checkpoint output/gaussiancube_finetuning_vehicle/checkpoints/step_004000/lora_model004000.pt
+    --resume_checkpoint output/gaussiancube_finetuning_vehicle_ema/checkpoints/step_005000/lora_model005000.pt
 
 echo "LoRA fine-tuning completed!"
 echo "Check results in: ./output/gaussiancube_finetuning/"
