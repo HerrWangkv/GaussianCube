@@ -16,6 +16,7 @@ import contextlib
 import numpy as np
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from PIL import Image
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
@@ -715,7 +716,8 @@ class LoRAFinetuneLoop:
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
         vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
-        return vgg_loss
+        mse_loss = F.mse_loss(refined_tensors, predicted_rendered_views)
+        return vgg_loss + 0.1 * mse_loss
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
