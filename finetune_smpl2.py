@@ -364,6 +364,8 @@ class LoRAFinetuneLoop:
             self.ema_params = [
                 copy.deepcopy(self.master_params) for _ in range(len(self.ema_rate))
             ]
+        if self.ema_params:
+            self._update_ema_model_params(self.ema_params[0])
 
         # Setup DDP
         if th.cuda.is_available():
@@ -432,6 +434,9 @@ class LoRAFinetuneLoop:
         if processed_resume_checkpoint:
             print("resume checkpoint: ", processed_resume_checkpoint)
             self.resume_step = parse_resume_step_from_filename(processed_resume_checkpoint)
+            print(
+                f"Resuming from checkpoint: {processed_resume_checkpoint} at step {self.resume_step}"
+            )
             if dist.get_rank() == 0:
                 logger.log(f"loading LoRA model from checkpoint: {processed_resume_checkpoint}...")
 
@@ -468,7 +473,7 @@ class LoRAFinetuneLoop:
         """Load optimizer state from checkpoint."""
         main_checkpoint = self.resume_checkpoint
         opt_checkpoint = os.path.join(
-            os.path.dirname(main_checkpoint), f"opt{self.resume_step:06}.pt"
+            os.path.dirname(main_checkpoint), f"lora_opt{self.resume_step:06}.pt"
         )
         if os.path.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
@@ -495,19 +500,22 @@ class LoRAFinetuneLoop:
 
         if dist.get_rank() == 0:
             iterator = trange(
-                self.step, self.max_steps + 1, desc="Training", dynamic_ncols=True
+                self.max_steps + 1,
+                desc="Training",
+                dynamic_ncols=True,
+                initial=self.step + self.resume_step,
             )
         else:
-            iterator = range(self.step, self.max_steps + 1)
+            iterator = range(self.step + self.resume_step, self.max_steps + 1)
         for _ in iterator:
             self.run_step()
-            if self.step % self.log_interval == 0:
+            if (self.step + self.resume_step) % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+            if (self.step + self.resume_step) % self.save_interval == 0:
                 self.save()
             self.step += 1
 
-        if (self.step - 1) % self.save_interval != 0:
+        if (self.step + self.resume_step - 1) % self.save_interval != 0:
             self.save()
 
     def run_step(self):
@@ -837,7 +845,9 @@ class LoRAFinetuneLoop:
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
             s_path = os.path.join(logger.get_dir(), "images")
             os.makedirs(s_path, exist_ok=True)
-            guidance_path = os.path.join(s_path, f"{self.step:08d}.png")
+            guidance_path = os.path.join(
+                s_path, f"{self.step + self.resume_step:08d}.png"
+            )
             total_loss = self.compute_loss(
                 pred_x0_denorm,
                 denoised_denorm,
@@ -1041,7 +1051,9 @@ def parse_resume_step_from_filename(filename):
     assert(filename.endswith(".pt"))
     filename=filename[:-3]
     if filename.startswith("model") or filename.startswith("lora_model"):
-        split = filename.split("_")[-1] if "lora_model" in filename else filename[5:]
+        split = (
+            filename.split("_")[-1][5:] if "lora_model" in filename else filename[5:]
+        )
     elif filename.startswith("ema") or filename.startswith("lora_ema"):
         split = filename.split("_")[-1]
     else:
@@ -1120,8 +1132,12 @@ def create_argparser():
                         help="Maximum training steps")
     parser.add_argument("--use_fp16", action="store_true",
                         help="Use mixed precision training")
-    parser.add_argument("--resume_checkpoint", type=str, default=None,
-                        help="Path to resume LoRA checkpoint")
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        required=True,
+        help="Path to resume LoRA checkpoint",
+    )
     parser.add_argument("--prompt_file", type=str, required=True,
                     help="Path to file containing training prompts")
     parser.add_argument("--poses_file", type=str, default="smpl/B1 - stand to walk_poses.npz",
@@ -1137,14 +1153,7 @@ def create_argparser():
                         help="Training image saving interval")
 
     # System configuration
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Random seed")
-    parser.add_argument(
-        "--lora_checkpoint",
-        type=str,
-        required=True,
-        help="Path to LoRA checkpoint to apply",
-    )
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
 
     return parser
 
@@ -1183,10 +1192,10 @@ def main():
     # Load pretrained weights
     print(f"Loading pretrained weights from {ckpt_path}...")
     model.load_state_dict(th.load(ckpt_path, map_location="cpu", weights_only=True))
-    
-    print(f"Applying LoRA weights from {args.lora_checkpoint}")
+
+    print(f"Applying LoRA weights from {args.resume_checkpoint}")
     model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
-    model.load_lora_weights(args.lora_checkpoint)
+    model.load_lora_weights(args.resume_checkpoint)
     model.eval()
 
     # Create diffusion process

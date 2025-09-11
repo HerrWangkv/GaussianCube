@@ -498,7 +498,7 @@ class LoRAFinetuneLoop:
                 self.max_steps + 1,
                 desc="Training",
                 dynamic_ncols=True,
-                initial=self.step + self.resume_step + 1,
+                initial=self.step + self.resume_step,
             )
         else:
             iterator = range(self.step + self.resume_step, self.max_steps + 1)

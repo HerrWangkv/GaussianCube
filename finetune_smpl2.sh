@@ -20,7 +20,7 @@ mpiexec -n 4 python finetune_smpl2.py \
     --use_fp16 \
     --use_tensorboard \
     --prompt_file human_prompts.txt \
-    --lora_checkpoint output/gaussiancube_finetuning_smpl/checkpoints/step_004000/lora_model004000.pt \
+    --resume_checkpoint output/gaussiancube_finetuning_smpl/checkpoints/step_004000/lora_model004000.pt \
 
 echo "LoRA fine-tuning completed!"
 echo "Check results in: ./output/gaussiancube_finetuning/"
