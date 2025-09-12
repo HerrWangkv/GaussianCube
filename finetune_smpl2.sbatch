@@ -3,7 +3,7 @@
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:full:4
 #SBATCH --mem=64G
 #SBATCH --time=72:00:00
 #SBATCH --output=logs/finetune_vehicle_%j.out
