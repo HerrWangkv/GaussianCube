@@ -856,10 +856,10 @@ class LoRAFinetuneLoop:
                 prompt,
                 save_guidance_path=guidance_path,
             )
-            total_loss = loss["lpips"] + loss["clip"]
+            total_loss = loss["lpips"] + 0.1 * loss["clip"]
         else:
             loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
-            total_loss = loss["lpips"] + loss["clip"]
+            total_loss = loss["lpips"] + 0.1 * loss["clip"]
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
         logger.logkv(
