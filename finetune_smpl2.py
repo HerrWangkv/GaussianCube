@@ -32,8 +32,7 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
-from utils.lpips.lpips import LPIPS
-from utils.similarity_loss import CLIPTextImageLoss
+from utils.similarity_loss import CLIPTextImageLoss, DinoImageLoss
 from utils.script_util import build_single_viewpoint_cam, init_volume_grid, create_gaussian_diffusion
 from model.nn import update_ema
 from model.resample import UniformSampler
@@ -398,8 +397,8 @@ class LoRAFinetuneLoop:
             self.ema_ddp_model = self.ema_model
 
         # Loss
-        self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
         self.clip = CLIPTextImageLoss(device=dist_util.dev())
+        self.dino = DinoImageLoss(device=dist_util.dev())
         # Tensorboard setup
         self.use_tensorboard = use_tensorboard
         if self.use_tensorboard and dist.get_rank() == 0:
@@ -608,7 +607,7 @@ class LoRAFinetuneLoop:
         face_cam_pose = orbit_camera(
             0,
             np.random.uniform(300, 420) % 360,
-            radius=0.5,
+            radius=0.3,
             target=np.array([0, 0.4, 0], dtype=np.float32),
             opengl=True,
         )
@@ -715,9 +714,9 @@ class LoRAFinetuneLoop:
             # Stack all rows vertically
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
+        dino_loss = self.dino(refined_tensors, predicted_rendered_views)
         clip_loss = self.clip(predicted_rendered_views, [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))])
-        return {"lpips": vgg_loss, "clip": clip_loss}
+        return {"dino": dino_loss, "clip": clip_loss}
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -856,10 +855,10 @@ class LoRAFinetuneLoop:
                 prompt,
                 save_guidance_path=guidance_path,
             )
-            total_loss = loss["lpips"] + 0.1 * loss["clip"]
+            total_loss = loss["dino"] + 0.1 * loss["clip"]
         else:
             loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
-            total_loss = loss["lpips"] + 0.1 * loss["clip"]
+            total_loss = loss["dino"] + 0.1 * loss["clip"]
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
         logger.logkv(
@@ -869,7 +868,7 @@ class LoRAFinetuneLoop:
         # Tensorboard logging
         if self.use_tensorboard and self.step % self.log_interval == 0 and dist.get_rank() == 0:
             log_dict = {
-                "lpips_loss": loss["lpips"],
+                "dino_loss": loss["dino"],
                 "clip_loss": loss["clip"],
                 "intermediate_t": intermediate_t,
                 "final_timestep": int(final_timestep[0]),
