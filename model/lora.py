@@ -467,53 +467,6 @@ def load_lora_weights(model: nn.Module, path: str):
                 if hasattr(lora_modules[module_name], param_type):
                     getattr(lora_modules[module_name], param_type).data.copy_(param_value)
 
-
-def merge_lora_weights(model: nn.Module, scaling: float = 1.0):
-    """
-    Merge LoRA weights into the original model weights.
-    This is useful for inference to avoid the overhead of LoRA computation.
-    """
-    for name, module in model.named_modules():
-        if hasattr(module, 'lora') and hasattr(module, 'original_layer'):
-            if module.lora.rank > 0:
-                # Compute LoRA weight delta
-                lora_weight = (module.lora.lora_B @ module.lora.lora_A) * module.lora.scaling * scaling
-                
-                # Add to original weights
-                if isinstance(module.original_layer, nn.Linear):
-                    module.original_layer.weight.data += lora_weight
-                elif isinstance(module.original_layer, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-                    # Reshape LoRA weight to match conv weight shape
-                    original_shape = module.original_layer.weight.shape
-                    lora_weight_reshaped = lora_weight.reshape(original_shape)
-                    module.original_layer.weight.data += lora_weight_reshaped
-                
-                # Zero out LoRA parameters after merging
-                module.lora.lora_A.data.zero_()
-                module.lora.lora_B.data.zero_()
-
-
-def unmerge_lora_weights(model: nn.Module, scaling: float = 1.0):
-    """
-    Unmerge LoRA weights from the original model weights.
-    This reverses the merge operation.
-    """
-    for name, module in model.named_modules():
-        if hasattr(module, 'lora') and hasattr(module, 'original_layer'):
-            if module.lora.rank > 0:
-                # Compute LoRA weight delta
-                lora_weight = (module.lora.lora_B @ module.lora.lora_A) * module.lora.scaling * scaling
-                
-                # Subtract from original weights
-                if isinstance(module.original_layer, nn.Linear):
-                    module.original_layer.weight.data -= lora_weight
-                elif isinstance(module.original_layer, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-                    # Reshape LoRA weight to match conv weight shape
-                    original_shape = module.original_layer.weight.shape
-                    lora_weight_reshaped = lora_weight.reshape(original_shape)
-                    module.original_layer.weight.data -= lora_weight_reshaped
-
-
 def print_lora_info(model: nn.Module):
     """
     Print information about LoRA adaptations in the model.

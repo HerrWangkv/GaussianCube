@@ -113,11 +113,10 @@ def main():
     print("Loaded ckpt: ", ckpt)
 
     # Add LoRA support
-    print(f"Applying LoRA weights from {args.lora_checkpoint}")
-    full_model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
-    full_model.load_lora_weights(args.lora_checkpoint)
-    full_model.eval()
-    full_model.to(dist_util.dev())
+    if args.lora_checkpoint is not None:
+        print(f"Applying LoRA weights from {args.lora_checkpoint}")
+        model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
+        model.load_lora_weights(args.lora_checkpoint)
 
     logger.configure(args.exp_name)
     options = logger.args_to_dict(args)
@@ -201,17 +200,11 @@ def main():
             samples = dpm_solver.sample(
                 x=noise,
                 t_start=1.0,
-                t_end=configs["guidance"]["timestep_range"][1],
+                t_end=1 / 1000,
                 order=2,
                 skip_type="time_uniform",
                 method="adaptive",
             )
-            final_timestep = torch.tensor(
-                [configs["guidance"]["timestep_range"][1] * diffusion.num_timesteps]
-            ).to(dist_util.dev())
-            samples_output = full_model(samples, final_timestep, **condition)
-            samples, _ = torch.split(samples_output, samples.shape[1], dim=1)
-
             samples_denorm = samples * std + mean
 
             frames = []
@@ -267,14 +260,14 @@ def create_argparser():
     parser.add_argument("--model_name", type=str,
                        default="objaverse_v1.1",
                        help="Name of the model to use")
-    parser.add_argument("--exp_name", type=str, default="tmp/car_lora/")
+    parser.add_argument("--exp_name", type=str, default="tmp/vehicle_lora/")
     parser.add_argument("--seed", type=int, default=0)
     # Model config
-    parser.add_argument("--config", type=str, default="configs/finetune.yml")
+    parser.add_argument("--config", type=str, default="configs/finetune_vehicle.yml")
     # Data args
     parser.add_argument("--active_sh_degree", type=int, default=0)
     # Inference args
-    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--render_video", action="store_true")
     parser.add_argument("--text", type=str, default="A car.")
@@ -283,7 +276,6 @@ def create_argparser():
         "--lora_checkpoint",
         type=str,
         default=None,
-        required=True,
         help="Path to LoRA checkpoint to apply (optional)",
     )
 

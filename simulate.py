@@ -12,6 +12,7 @@ from mpi4py import MPI
 from huggingface_hub import hf_hub_download
 
 from model.unet import UNetModel
+from model.lora_unet import convert_unet_to_lora
 from model.clip import FrozenCLIPEmbedder
 from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver
 from utils import dist_util, logger
@@ -36,46 +37,14 @@ MODEL_TYPES = {
 
 # Model repository mapping
 MODEL_REPOS = {
-    "objaverse_v1.0": {
-        "repo_id": "BwZhang/GaussianCube-Objaverse",
-        "revision": "main",
-        "model_path": "v1.0/objaverse_ckpt.pt",
-        "mean_path": "v1.0/mean.pt",
-        "std_path": "v1.0/std.pt",
-        "bound": 0.5
-    },
     "objaverse_v1.1": {
         "repo_id": "BwZhang/GaussianCube-Objaverse",
         "revision": "main",
         "model_path": "v1.1/objaverse_ckpt.pt",
         "mean_path": "v1.1/mean.pt",
         "std_path": "v1.1/std.pt",
-        "bound": 0.5
+        "bound": 0.5,
     },
-    "omniobject3d": {
-        "repo_id": "BwZhang/GaussianCube-OmniObject3D-v1.0",
-        "revision": "main",
-        "model_path": "OmniObject3D_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 1.0
-    },
-    "shapenet_car": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetCar-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_car_ckpt.pt", 
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.45
-    },
-    "shapenet_chair": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetChair-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_chair_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.35
-    }
 }
 
 def download_model_files(model_name):
@@ -133,10 +102,12 @@ def quat_multiply(quaternion0, quaternion1):
 
     return torch.concat((w, x, y, z), dim=-1)
 
-def initialize_shared_models():
+
+def initialize_shared_models(vehicle_lora_path):
     """Initialize models once to be shared across all objects."""
 
     model_and_diffusion_config = OmegaConf.load("configs/objaverse_text_cond.yml")
+    vehicle_config = OmegaConf.load("configs/finetune_vehicle.yml")
     downloaded_files = download_model_files("objaverse_v1.1")
 
     ckpt = downloaded_files["ckpt"]
@@ -151,31 +122,38 @@ def initialize_shared_models():
     model = UNetModel(**model_and_diffusion_config['model'])
 
     diffusion = create_gaussian_diffusion(**model_and_diffusion_config['diffusion'])
-    model.load_state_dict(torch.load(ckpt, map_location="cpu"))
-    model.to(dist_util.dev())
-    model.eval()
+    model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
+    vehicle_model = convert_unet_to_lora(
+        model, **vehicle_config["lora"], **model_and_diffusion_config["model"]
+    )
+    vehicle_model.load_lora_weights(vehicle_lora_path)
+    vehicle_model.to(dist_util.dev())
+    vehicle_model.eval()
 
     clip_text_encoder = FrozenCLIPEmbedder()
     clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
     noise_schedule = NoiseScheduleVP(schedule='discrete', betas=torch.from_numpy(diffusion.betas).to(dist_util.dev()))
 
     std_volume = torch.tensor(init_volume_grid(bound=bound, num_pts_each_axis=32)).to(torch.float32).to(dist_util.dev()).contiguous()
-    mean = torch.load(mean_file).to(torch.float32).to(dist_util.dev())
-    std = torch.load(std_file).to(torch.float32).to(dist_util.dev())
+    mean = (
+        torch.load(mean_file, weights_only=True).to(torch.float32).to(dist_util.dev())
+    )
+    std = torch.load(std_file, weights_only=True).to(torch.float32).to(dist_util.dev())
 
     mean = mean.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
     std = std.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
 
     return {
-        'model': model,
-        'diffusion': diffusion,
-        'clip_text_encoder': clip_text_encoder,
-        'noise_schedule': noise_schedule,
-        'std_volume': std_volume,
-        'mean': mean,
-        'std': std,
-        'config': model_and_diffusion_config
+        "vehicle_model": vehicle_model,
+        "diffusion": diffusion,
+        "clip_text_encoder": clip_text_encoder,
+        "noise_schedule": noise_schedule,
+        "std_volume": std_volume,
+        "mean": mean,
+        "std": std,
+        "config": model_and_diffusion_config,
     }
+
 
 def rpy2rotations(roll, pitch, yaw):
     """
@@ -191,21 +169,19 @@ def rpy2rotations(roll, pitch, yaw):
     ]).cuda()
 
 
-def create_objects_batched(objects_info, shared_models, max_batch_size=32):
+def create_vehicles_batched(objects_info, shared_models, max_batch_size=8):
     """Create multiple objects in a single batched diffusion run."""
     if not objects_info:
         return []
-
     # Split into smaller batches if needed
     all_created_objects = []
-    model = shared_models["model"]
+    model = shared_models["vehicle_model"]
     clip_text_encoder = shared_models["clip_text_encoder"]
     noise_schedule = shared_models["noise_schedule"]
     std_volume = shared_models["std_volume"]
     mean = shared_models["mean"]
     std = shared_models["std"]
     model_and_diffusion_config = shared_models["config"]
-    cond_gen = text_cond = True
     image_size = model_and_diffusion_config["model"]["image_size"]
 
     for i in range(0, len(objects_info), max_batch_size):
@@ -214,14 +190,9 @@ def create_objects_batched(objects_info, shared_models, max_batch_size=32):
         print(f"Creating batch of {batch_size} objects...")
 
         # Encode all text prompts
-        category_names = [obj_info["category_name"] for obj_info in batch_info]
-        batched_text_features = clip_text_encoder.encode(category_names)
-        condition, unconditional_condition = {}, {}
-        if text_cond:
-            condition["cond_text"] = batched_text_features
-            unconditional_condition["cond_text"] = torch.zeros_like(
-                batched_text_features
-            )
+        prompts = [obj_info["prompt"] for obj_info in batch_info]
+        batched_text_features = clip_text_encoder.encode(prompts)
+        condition = {"cond_text": batched_text_features}
 
         model_fn = model_wrapper(
             model,
@@ -229,11 +200,7 @@ def create_objects_batched(objects_info, shared_models, max_batch_size=32):
             model_type=MODEL_TYPES[
                 model_and_diffusion_config["diffusion"]["predict_type"]
             ],
-            model_kwargs={},
-            guidance_type="uncond" if not cond_gen else "classifier-free",
-            guidance_scale=3.5,
-            condition=None if not cond_gen else condition,
-            unconditional_condition=None if not cond_gen else unconditional_condition,
+            model_kwargs=condition,
         )
         dpm_solver = DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++")
 
@@ -249,24 +216,21 @@ def create_objects_batched(objects_info, shared_models, max_batch_size=32):
                 device=dist_util.dev(),
             )
 
-            with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-                samples = dpm_solver.sample(
-                    x=batched_noise,
-                    steps=100,
-                    t_start=1.0,
-                    t_end=1 / 1000,
-                    order=2,  # Use order 2 for batched processing
-                    skip_type="time_uniform",
-                    method="adaptive" if text_cond else "multistep",
-                )
+            samples = dpm_solver.sample(
+                x=batched_noise,
+                t_start=1.0,
+                t_end=1 / 1000,
+                order=2,
+                skip_type="time_uniform",
+                method="adaptive",
+            )
             samples_denorm = samples * std.unsqueeze(0) + mean.unsqueeze(0)
 
         # Create Object3D instances for each sample in this batch
         for i, obj_info in enumerate(batch_info):
             obj = Object3D(
-                id=obj_info["obj_id"],
                 size=torch.tensor(obj_info["size"]).cuda(),
-                category_name=obj_info["category_name"],
+                prompt=obj_info["prompt"],
                 initial_gs=parse_volume_data(
                     samples_denorm[i], std_volume, active_sh_degree=0
                 ),
@@ -275,15 +239,15 @@ def create_objects_batched(objects_info, shared_models, max_batch_size=32):
 
     return all_created_objects
 
+
 class Object3D:
 
-    def __init__(self, id, size, category_name, initial_gs):
-        self._id = id
-        self._size = torch.tensor(size).cuda()
-        self._text = category_name
+    def __init__(self, size, prompt, initial_gs):
+        self._size = size.clone().detach().cuda()
+        self._text = prompt
         self._initial_gs = initial_gs
         self.centerlize_and_scale_initial_gs()
-        print(f"\tAdd {category_name} {id}")
+        print(f"\tAdd {prompt}")
 
     def transform_gs(self, transformation_matrix):
         '''
@@ -437,6 +401,9 @@ def render(gs, intrinsics, extrinsics, save_path='render.png'):
 def parse_args():
     parser = argparse.ArgumentParser(description="Render 3D objects in a scene.")
     parser.add_argument("--scene-idx", type=int, default=0, help="Index of the scene to render.")
+    parser.add_argument(
+        "--vehicle-lora", type=str, default=None, help="Path to the vehicle LoRA model."
+    )
     return parser.parse_args()
 
 def main():
@@ -449,8 +416,76 @@ def main():
     cams = ['CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
 
     # Initialize shared models once
-    shared_models = initialize_shared_models()
+    shared_models = initialize_shared_models(args.vehicle_lora)
 
+    # Collect new objects to create in parallel
+    vehicles_to_create = []
+    existing_vehicles = []
+
+    vehicle_colors = [
+        "a red",
+        "a blue",
+        "a green",
+        "a yellow",
+        "a black",
+        "a white",
+        "a silver",
+        "a gray",
+        "an orange",
+        "a brown",
+    ]
+    vehicle_types = {
+        "vehicle.car": [
+            "sedan",
+            "coupe",
+            "hatchback",
+            "van",
+            "minivan",
+            "SUV",
+            "sports car",
+        ],
+        "vehicle.bus": ["bus"],
+        "vehicle.truck": ["pickup truck", "truck"],
+    }
+    for t in range(scene["nbr_samples"]):
+        sample_token = scene["first_sample_token"] if sample is None else sample["next"]
+        sample = nusc.get("sample", sample_token)
+        for _, ann_token in enumerate(sample["anns"]):
+            ann = nusc.get("sample_annotation", ann_token)
+            if ann["category_name"] not in [
+                "vehicle.car",
+                "vehicle.bus",
+                "vehicle.truck",
+            ]:
+                continue
+            size = ann["size"]
+            inst_token = ann["instance_token"]
+
+            if inst_token not in existing_vehicles:
+                # Queue for parallel creation
+                vehicles_to_create.append(
+                    {
+                        "inst_token": inst_token,
+                        "size": size,
+                        "prompt": vehicle_colors[
+                            random.randint(0, len(vehicle_colors) - 1)
+                        ]
+                        + " "
+                        + vehicle_types[ann["category_name"]][
+                            random.randint(
+                                0, len(vehicle_types[ann["category_name"]]) - 1
+                            )
+                        ],
+                    }
+                )
+                existing_vehicles.append(inst_token)
+    del existing_vehicles
+    sample = None
+
+    created_vehicles = create_vehicles_batched(vehicles_to_create, shared_models)
+    # Store created objects and transform them
+    for obj, obj_info in zip(created_vehicles, vehicles_to_create):
+        objects[obj_info["inst_token"]] = obj
     for t in range(scene['nbr_samples']):
         gs = None
         print(f"Processing frame {t}")
@@ -467,61 +502,32 @@ def main():
         ego_to_world[:3, :3] = Quaternion(ego_pose['rotation']).rotation_matrix
         ego_to_world[:3, 3] = ego_pose['translation']
         cam_front_to_world = ego_to_world @ cam_front_to_ego
-
-        # Collect new objects to create in parallel
-        new_objects_to_create = []
-        existing_objects = []
-
-        for i, ann_token in enumerate(sample['anns']):
+        current_vehicle_gs = []
+        for _, ann_token in enumerate(sample["anns"]):
             ann = nusc.get('sample_annotation', ann_token)
-            size = ann['size']
+            if ann["category_name"] not in [
+                "vehicle.car",
+                "vehicle.bus",
+                "vehicle.truck",
+            ]:
+                continue
             inst_token = ann['instance_token']
+            assert (
+                inst_token in objects
+            ), f"Warning: instance {inst_token} not found in created objects."
+            obj = objects[inst_token]
 
-            if inst_token not in objects:
-                # Queue for parallel creation
-                new_objects_to_create.append(
-                    {
-                        "inst_token": inst_token,
-                        "obj_id": len(objects) + len(new_objects_to_create),
-                        "size": size,
-                        "category_name": ann["category_name"],
-                        "ann": ann,
-                    }
-                )
-            else:
-                # Existing object, process immediately
-                obj = objects[inst_token]
-                obj_to_cam_front = get_obj_to_cam_front(
-                    ann["rotation"], ann["translation"], cam_front_to_world
-                )
-                obj_gs = obj.transform_gs(obj_to_cam_front)
-                existing_objects.append(obj_gs)
-
-        # Create new objects in batch
-        new_objects = []
-        if new_objects_to_create:
-            created_objects = create_objects_batched(
-                new_objects_to_create, shared_models
+            # Transform the new object
+            obj_to_cam_front = get_obj_to_cam_front(
+                ann["rotation"],
+                ann["translation"],
+                cam_front_to_world,
             )
-
-            # Store created objects and transform them
-            for obj, obj_info in zip(created_objects, new_objects_to_create):
-                objects[obj_info["inst_token"]] = obj
-
-                # Transform the new object
-                obj_to_cam_front = get_obj_to_cam_front(
-                    obj_info["ann"]["rotation"],
-                    obj_info["ann"]["translation"],
-                    cam_front_to_world,
-                )
-                obj_gs = obj.transform_gs(obj_to_cam_front)
-                new_objects.append(obj_gs)
-
-        # Combine all gaussian splats
-        all_gs = existing_objects + new_objects
-        if all_gs:
-            gs = all_gs[0]
-            for obj_gs in all_gs[1:]:
+            obj_gs = obj.transform_gs(obj_to_cam_front)
+            current_vehicle_gs.append(obj_gs)
+        if current_vehicle_gs:
+            gs = current_vehicle_gs[0]
+            for obj_gs in current_vehicle_gs[1:]:
                 for key in gs.keys():
                     gs[key] = torch.vstack([gs[key], obj_gs[key]])
         else:
@@ -534,7 +540,9 @@ def main():
 
     # Generate a video from the saved frames
     frame_paths = sorted(glob.glob(f"videos/{args.scene_idx}/rendered_images/frame_*.png"))
-    with imageio.get_writer(f'videos/{args.scene_idx}/objaverse.mp4', fps=2) as video_writer:
+    with imageio.get_writer(
+        f"videos/{args.scene_idx}/objects.mp4", fps=2
+    ) as video_writer:
         for frame_path in frame_paths:
             frame = imageio.imread(frame_path)
             video_writer.append_data(frame)

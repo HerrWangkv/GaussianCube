@@ -118,8 +118,6 @@ def main():
         print(f"Applying LoRA weights from {args.lora_checkpoint}")
         model = convert_unet_to_lora(model, **configs["lora"], **configs["model"])
         model.load_lora_weights(args.lora_checkpoint)
-        model.eval()
-        model.to(dist_util.dev())
 
     logger.configure(args.exp_name)
     options = logger.args_to_dict(args)
@@ -264,7 +262,7 @@ def create_argparser():
     parser.add_argument("--model_name", type=str, 
                         default="objaverse_v1.1",
                        help="Name of the model to use")
-    parser.add_argument("--exp_name", type=str, default="tmp/smpl_vanilla")
+    parser.add_argument("--exp_name", type=str, default="tmp/smpl_lora")
     parser.add_argument("--seed", type=int, default=0)
     # Model config
     parser.add_argument("--config", type=str, default="configs/finetune_smpl.yml")
