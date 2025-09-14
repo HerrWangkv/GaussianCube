@@ -161,7 +161,7 @@ class LoRAFinetuneLoop:
         prompt_file=None,
         poses_file=None,
         use_tensorboard=True,
-        ema_rate=0.9999,
+        ema_rate=0.99,
         weight_decay=0.0,
         max_grad_norm=1.0,
         fp16_scale_growth=1e-3,
@@ -607,13 +607,13 @@ class LoRAFinetuneLoop:
         face_cam_pose = orbit_camera(
             0,
             np.random.uniform(300, 420) % 360,
-            radius=0.3,
+            radius=0.5,
             target=np.array([0, 0.4, 0], dtype=np.float32),
             opengl=True,
         )
         face_cam_pose = convert_mat @ face_cam_pose
         face_cam = load_cam(
-            c2w=face_cam_pose, orig_image_size=self.render_resolution, fovx=1.0
+            c2w=face_cam_pose, orig_image_size=self.render_resolution, fovx=0.5
         )
         for k, v in face_cam.items():
             if not isinstance(v, th.Tensor):
