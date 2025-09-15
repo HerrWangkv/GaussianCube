@@ -13,16 +13,15 @@ export OMPI_MCA_orte_tmpdir_base=${OMPI_MCA_orte_tmpdir_base:-/tmp}
 
 # Add proper GPU binding for MPI ranks
 mpiexec -n 4 python finetune_smpl2.py \
-    --exp_name ./output/gaussiancube_finetuning_smpl2_ema9 \
+    --exp_name ./output/gaussiancube_finetuning_smpl2_ema10 \
     --config configs/finetune_smpl2.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
-    --max_steps 20000 \
+    --max_steps 15000 \
     --image_save_interval 50 \
     --use_fp16 \
     --use_tensorboard \
-    --prompt_file human_prompts.txt \
-    --resume_checkpoint output/gaussiancube_finetuning_smpl2_ema6/checkpoints/step_014000/lora_model014000.pt
+    --resume_checkpoint output/gaussiancube_finetuning_smpl2_ema2/checkpoints/step_009000/lora_model009000.pt
 
 echo "LoRA fine-tuning completed!"
 echo "Check results in: ./output/gaussiancube_finetuning/"

@@ -11,7 +11,7 @@ import copy
 import os
 import time
 import glob
-import imageio
+import random
 import contextlib
 import numpy as np
 import torch as th
@@ -32,6 +32,7 @@ from utils.fp16_util import (
     unflatten_master_params,
     zero_grad,
 )
+from utils.lpips.lpips import LPIPS
 from utils.similarity_loss import CLIPTextImageLoss, DinoImageLoss
 from utils.script_util import build_single_viewpoint_cam, init_volume_grid, create_gaussian_diffusion
 from model.nn import update_ema
@@ -50,47 +51,55 @@ INITIAL_LOG_LOSS_SCALE = 20.0
 
 # Model repository mapping (from inference.py)
 MODEL_REPOS = {
-    "objaverse_v1.0": {
-        "repo_id": "BwZhang/GaussianCube-Objaverse",
-        "revision": "main",
-        "model_path": "v1.0/objaverse_ckpt.pt",
-        "mean_path": "v1.0/mean.pt",
-        "std_path": "v1.0/std.pt",
-        "bound": 0.5
-    },
     "objaverse_v1.1": {
         "repo_id": "BwZhang/GaussianCube-Objaverse",
         "revision": "main",
         "model_path": "v1.1/objaverse_ckpt.pt",
         "mean_path": "v1.1/mean.pt",
         "std_path": "v1.1/std.pt",
-        "bound": 0.5
+        "bound": 0.5,
     },
-    "omniobject3d": {
-        "repo_id": "BwZhang/GaussianCube-OmniObject3D-v1.0",
-        "revision": "main",
-        "model_path": "OmniObject3D_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 1.0
-    },
-    "shapenet_car": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetCar-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_car_ckpt.pt", 
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.45
-    },
-    "shapenet_chair": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetChair-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_chair_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.35
-    }
 }
+
+
+def generate_human_prompt():
+    races = ["An Asian", "An African", "A Caucasian", "A Mixed-race"]
+    genders = ["man", "woman"]
+    hair_colors = ["black", "brown", "blonde", "red", "gray", "white"]
+    glasses = ["wearing glasses", "wearing no glasses"]
+    cloth_colors = [
+        "red",
+        "blue",
+        "green",
+        "black",
+        "white",
+        "yellow",
+        "purple",
+        "pink",
+        "orange",
+        "gray",
+        "brown",
+    ]
+    tops = [
+        "t-shirt",
+        "shirt",
+        "jacket",
+        "sweater",
+        "hoodie",
+        "coat",
+        "dress",
+        "blouse",
+    ]
+    pants = ["jeans", "trousers", "shorts", "leggings"]
+    shoes = ["sneakers", "boots", "sandals"]
+
+    prompt = (
+        f"{random.choice(races)} {random.choice(genders)} with {random.choice(hair_colors)} hair, "
+        f"{random.choice(glasses)}, wearing a {random.choice(cloth_colors)} {random.choice(tops)}, "
+        f"{random.choice(cloth_colors)} {random.choice(pants)}, and {random.choice(cloth_colors)} {random.choice(shoes)}"
+    )
+
+    return prompt
 
 
 def ignore_stderr(func):
@@ -158,7 +167,6 @@ class LoRAFinetuneLoop:
         max_steps=50000,
         use_fp16=True,
         resume_checkpoint=None,
-        prompt_file=None,
         poses_file=None,
         use_tensorboard=True,
         ema_rate=0.99,
@@ -210,7 +218,6 @@ class LoRAFinetuneLoop:
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
             guidance_scale: guidance scale
-            prompt_file: File containing training prompts
             timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
             ... (other parameters similar to TrainLoop)
@@ -293,9 +300,6 @@ class LoRAFinetuneLoop:
         print("Initializing CLIP text encoder for GaussianCube conditioning...")
         self.clip_text_encoder = FrozenCLIPEmbedder()
         self.clip_text_encoder = self.clip_text_encoder.eval().to(dist_util.dev())
-
-        # Load prompts for SDS guidance
-        self.prompts = self._load_prompts(prompt_file)
 
         # Data normalization (same as original)
         if mean_file is not None and std_file is not None:
@@ -398,22 +402,11 @@ class LoRAFinetuneLoop:
 
         # Loss
         self.clip = CLIPTextImageLoss(device=dist_util.dev())
-        self.dino = DinoImageLoss(device=dist_util.dev())
+        self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
         # Tensorboard setup
         self.use_tensorboard = use_tensorboard
         if self.use_tensorboard and dist.get_rank() == 0:
             self.writer = logger.Visualizer(os.path.join(logger.get_dir(), 'tf_events'))
-
-    def _load_prompts(self, prompt_file):
-        """Load training prompts from file or use default prompts."""
-        if prompt_file and os.path.exists(prompt_file):
-            with open(prompt_file, 'r') as f:
-                prompts = [line.strip() for line in f.readlines() if line.strip()]
-            print(f"Loaded {len(prompts)} prompts from {prompt_file}")
-        else:
-            raise FileNotFoundError("Prompt file not found, and no default prompts provided.")
-
-        return prompts
 
     def _load_poses(self, poses_file):
         """Load training poses from file or use default poses."""
@@ -714,9 +707,9 @@ class LoRAFinetuneLoop:
             # Stack all rows vertically
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        dino_loss = self.dino(refined_tensors, predicted_rendered_views)
+        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
         clip_loss = self.clip(predicted_rendered_views, [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))])
-        return {"dino": dino_loss, "clip": clip_loss}
+        return {"vgg": vgg_loss, "clip": clip_loss}
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -733,7 +726,7 @@ class LoRAFinetuneLoop:
         noise = th.randn(shape, device=dist_util.dev(), dtype=th.float32)
 
         # Select random prompt
-        prompt = np.random.choice(self.prompts)
+        prompt = generate_human_prompt()
 
         # Get text embeddings for GaussianCube diffusion conditioning
         clip_text_embeds = self.clip_text_encoder.encode(
@@ -855,10 +848,10 @@ class LoRAFinetuneLoop:
                 prompt,
                 save_guidance_path=guidance_path,
             )
-            total_loss = loss["dino"] + 0.1 * loss["clip"]
+            total_loss = loss["vgg"] + 0.1 * loss["clip"]
         else:
             loss = self.compute_loss(pred_x0_denorm, denoised_denorm, prompt)
-            total_loss = loss["dino"] + 0.1 * loss["clip"]
+            total_loss = loss["vgg"] + 0.1 * loss["clip"]
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
         logger.logkv(
@@ -868,7 +861,7 @@ class LoRAFinetuneLoop:
         # Tensorboard logging
         if self.use_tensorboard and self.step % self.log_interval == 0 and dist.get_rank() == 0:
             log_dict = {
-                "dino_loss": loss["dino"],
+                "vgg_loss": loss["vgg"],
                 "clip_loss": loss["clip"],
                 "intermediate_t": intermediate_t,
                 "final_timestep": int(final_timestep[0]),
@@ -1142,8 +1135,6 @@ def create_argparser():
         required=True,
         help="Path to resume LoRA checkpoint",
     )
-    parser.add_argument("--prompt_file", type=str, required=True,
-                    help="Path to file containing training prompts")
     parser.add_argument("--poses_file", type=str, default="smpl/B1 - stand to walk_poses.npz",
                     help="Path to file containing training poses")
     parser.add_argument("--use_tensorboard", action="store_true",
@@ -1227,7 +1218,6 @@ def main():
         max_steps=args.max_steps,
         use_fp16=args.use_fp16,
         resume_checkpoint=args.resume_checkpoint,
-        prompt_file=args.prompt_file,
         poses_file=args.poses_file,
         use_tensorboard=args.use_tensorboard,
         mean_file=mean_file,
