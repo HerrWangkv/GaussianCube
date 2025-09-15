@@ -59,6 +59,7 @@ class DinoImageLoss(nn.Module):
             model_name,
             dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             use_safetensors=True,
+            output_hidden_states=True,
         ).to(self.device)
 
         self.processor = AutoImageProcessor.from_pretrained(model_name)
@@ -77,25 +78,40 @@ class DinoImageLoss(nn.Module):
         """
         # Resize to model input size and Normalize to model stats
         gen_images = F.interpolate(
-            gen_images, size=(224, 224), mode="bilinear", align_corners=False
+            gen_images,
+            size=(self.size, self.size),
+            mode="bilinear",
+            align_corners=False,
         )
         ref_images = F.interpolate(
-            ref_images, size=(224, 224), mode="bilinear", align_corners=False
+            ref_images,
+            size=(self.size, self.size),
+            mode="bilinear",
+            align_corners=False,
         )
         gen_images = (gen_images - self.mean) / self.std
         ref_images = (ref_images - self.mean) / self.std
 
         # Encode generated images
-        gen_features = self.model(pixel_values=gen_images).last_hidden_state
-        gen_features = F.normalize(gen_features.mean(dim=1), dim=-1)
+        gen_out = self.model(pixel_values=gen_images)
+        ref_out = self.model(pixel_values=ref_images)
+        layers = [4, 8, 12, 16, 20, 24]
+        loss = 0
+        for i in layers:
+            g = gen_out.hidden_states[i][:, 1:, :]  # drop CLS
+            r = ref_out.hidden_states[i][:, 1:, :]
+            B, T, D = g.shape
+            H = W = int(T**0.5)
 
-        ref_features = self.model(pixel_values=ref_images).last_hidden_state
-        ref_features = F.normalize(ref_features.mean(dim=1), dim=-1)
+            g = g.permute(0, 2, 1).reshape(B, D, H, W)
+            r = r.permute(0, 2, 1).reshape(B, D, H, W)
 
-        # Compute simple similarity loss (maximize cosine similarity)
-        loss = 1 - (gen_features * ref_features).sum(dim=-1).mean()
-        return loss
+            # Channel-wise normalization (like LPIPS)
+            g = F.normalize(g, dim=1)
+            r = F.normalize(r, dim=1)
 
+            loss += F.mse_loss(g, r, reduction="mean")
+        return loss / len(layers)
 
 # Example usage
 if __name__ == "__main__":

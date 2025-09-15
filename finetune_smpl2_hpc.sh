@@ -13,7 +13,7 @@ export OMPI_MCA_orte_tmpdir_base=${OMPI_MCA_orte_tmpdir_base:-/tmp}
 
 # Add proper GPU binding for MPI ranks
 mpiexec -n 4 python finetune_smpl2.py \
-    --exp_name ./output/gaussiancube_finetuning_smpl2_ema8 \
+    --exp_name ./output/gaussiancube_finetuning_smpl2_ema9 \
     --config configs/finetune_smpl2.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
