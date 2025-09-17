@@ -161,7 +161,7 @@ class LoRAFinetuneLoop:
         prompt_file=None,
         poses_file=None,
         use_tensorboard=True,
-        ema_rate=0.99,
+        ema_rate=0.9999,
         weight_decay=0.0,
         max_grad_norm=1.0,
         fp16_scale_growth=1e-3,
