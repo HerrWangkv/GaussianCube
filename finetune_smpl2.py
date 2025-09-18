@@ -784,9 +784,10 @@ class LoRAFinetuneLoop:
                 skip_type="time_uniform",
                 method="multistep",
             )
-            intermediate_t = np.random.uniform(
-                *self.timestep_range
-            )  # Random intermediate timestep
+            # Biased sampling towards larger timesteps (more noise)
+            # Using beta distribution with alpha=1, beta=3 to bias towards higher values
+            u = np.random.beta(3, 1)  # This biases towards values closer to 1
+            intermediate_t = self.timestep_range[0] + u * (self.timestep_range[1] - self.timestep_range[0])
             partially_denoised = dpm_solver.sample(
                 x=noise,
                 steps=100,
