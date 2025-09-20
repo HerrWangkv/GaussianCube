@@ -3,6 +3,7 @@
 docker run -it --rm --gpus all --name GaussianCube \
   --privileged \
   --ipc=host \
+  -u $(id -u):$(id -g) \
   --device /dev/fuse \
   -e XDG_CACHE_HOME=/workspace/.cache \
   -e MPLCONFIGDIR=/workspace/.cache/.config/matplotlib \

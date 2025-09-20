@@ -40,6 +40,47 @@ MODEL_REPOS = {
     },
 }
 
+
+def generate_human_prompt():
+    races = ["An Asian", "An African", "A Caucasian", "A Mixed-race"]
+    genders = ["man", "woman"]
+    hair_colors = ["black", "brown", "blonde", "red", "gray", "white"]
+    glasses = ["wearing glasses", "wearing no glasses"]
+    cloth_colors = [
+        "red",
+        "blue",
+        "green",
+        "black",
+        "white",
+        "yellow",
+        "purple",
+        "pink",
+        "orange",
+        "gray",
+        "brown",
+    ]
+    tops = [
+        "t-shirt",
+        "shirt",
+        "jacket",
+        "sweater",
+        "hoodie",
+        "coat",
+        "dress",
+        "blouse",
+    ]
+    pants = ["jeans", "trousers", "shorts", "leggings"]
+    shoes = ["sneakers", "boots", "sandals"]
+
+    prompt = (
+        f"{random.choice(races)} {random.choice(genders)} with {random.choice(hair_colors)} hair, "
+        f"{random.choice(glasses)}, wearing a {random.choice(cloth_colors)} {random.choice(tops)}, "
+        f"{random.choice(cloth_colors)} {random.choice(pants)}, and {random.choice(cloth_colors)} {random.choice(shoes)}"
+    )
+
+    return prompt
+
+
 def download_model_files(model_name):
     """Download model files from Hugging Face Hub."""
     if model_name not in MODEL_REPOS:
@@ -130,8 +171,9 @@ def main():
 
     clip_text_encoder = FrozenCLIPEmbedder()
     clip_text_encoder = clip_text_encoder.eval().to(dist_util.dev())
-    if args.text:
-        text_features = clip_text_encoder.encode(args.text)
+    prompt = generate_human_prompt()
+    print("Text prompt: ", prompt)
+    text_features = clip_text_encoder.encode(prompt)
 
     val_data = load_data(
         batch_size=1,
@@ -148,9 +190,33 @@ def main():
     mean = mean.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
     std = std.permute(3, 0, 1, 2).requires_grad_(False).contiguous()
 
-    human_model = SMPLinGaussianCube("smpl/SMPL_NEUTRAL.pkl", std_volume=std_volume, gc_mean=mean, gc_std=std, device=dist_util.dev())
-    fixed_x0 = human_model.fixed_x0
-    # initial_x0 = human_model.initial_x0
+    neutral_human_model = SMPLinGaussianCube(
+        "smpl/SMPL_NEUTRAL.pkl",
+        std_volume=std_volume,
+        gc_mean=mean,
+        gc_std=std,
+        device=dist_util.dev(),
+    )
+    if "woman" in prompt:
+        actual_human_model = SMPLinGaussianCube(
+            "smpl/SMPL_FEMALE.pkl",
+            std_volume=std_volume,
+            gc_mean=mean,
+            gc_std=std,
+            device=dist_util.dev(),
+            betas=torch.randn([1, 10]),
+        )
+    else:
+        actual_human_model = SMPLinGaussianCube(
+            "smpl/SMPL_MALE.pkl",
+            std_volume=std_volume,
+            gc_mean=mean,
+            gc_std=std,
+            device=dist_util.dev(),
+            betas=torch.randn([1, 10]),
+        )
+    fixed_x0 = neutral_human_model.fixed_x0
+    # initial_x0 = neutral_human_model.initial_x0
     def correcting_xt_fn(xt, t, step, factor=1.0):
         alpha_t, sigma_t = noise_schedule.marginal_alpha(
             t
@@ -207,21 +273,25 @@ def main():
                 method='multistep',
             )
             samples_denorm = samples * std + mean
-            human_model.update_rest_attributes(samples_denorm[0])
+            actual_human_model.update_rest_attributes(
+                samples_denorm[0], assignments=neutral_human_model.assignments
+            )
             frames = []
             for pose_id, pose in enumerate(tqdm(poses)):
                 new_global_orient = torch.zeros([1, 3], device=dist_util.dev())
                 new_global_orient[0] = torch.from_numpy(pose[:3]).to(dist_util.dev())
                 new_body_pose = torch.zeros([1, 69], device=dist_util.dev())  # 23*3 axis-angle
                 new_body_pose[0, :63] = torch.from_numpy(pose[3:66]).to(dist_util.dev())
-                human_model.apply_pose(body_pose=new_body_pose, global_orient=new_global_orient)
-                new_samples_denorm = human_model.to_x0_denorm()
+                actual_human_model.apply_pose(
+                    body_pose=new_body_pose, global_orient=new_global_orient
+                )
+                new_samples_denorm = actual_human_model.to_x0_denorm()
                 for i, cam_info in enumerate(model_kwargs["cams"]):
                     # if pose_id % len(model_kwargs["cams"]) != i:
                     #     continue
                     cam = build_single_viewpoint_cam(cam_info, 0)
                     # openpose_img, _ = smpl_to_openpose(
-                    #     human_model.splats["joints"],
+                    #     neutral_human_model.splats["joints"],
                     #     cam_info["full_proj_transform"].squeeze(),
                     #     int(cam_info["image_width"]),
                     #     int(cam_info["image_height"]),
@@ -251,10 +321,18 @@ def main():
             if args.render_video:
                 s_path = os.path.join(logger.get_dir(), 'videos')
                 os.makedirs(s_path,exist_ok=True)
-                imageio.mimwrite(os.path.join(s_path, "rank_{:02}_render_{:06}.mp4".format(dist.get_rank(), img_id)), frames, fps=30)
+                imageio.mimwrite(
+                    os.path.join(
+                        s_path,
+                        "rank_{:02}_render_{:06}.mp4".format(dist.get_rank(), img_id),
+                    ),
+                    frames,
+                    fps=120,
+                )
 
         img_id += 1
-
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def create_argparser():
     parser = argparse.ArgumentParser()
@@ -274,7 +352,6 @@ def create_argparser():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--rescale_timesteps", type=int, default=100)
     parser.add_argument("--render_video", action="store_true")
-    parser.add_argument("--text", type=str, default="A human.")
     parser.add_argument(
         "--lora_checkpoint",
         type=str,

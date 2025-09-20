@@ -11,15 +11,14 @@ export NCCL_P2P_DISABLE=1
 
 # Add proper GPU binding for MPI ranks
 mpiexec -n 4 python finetune_smpl.py \
-    --exp_name ./output/gaussiancube_finetuning_smpl \
+    --exp_name ./output/finetune_smpl_0920_0257 \
     --config configs/finetune_smpl.yml \
     --model_name objaverse_v1.1 \
     --lr 5e-5 \
-    --max_steps 4000 \
+    --max_steps 20000 \
     --image_save_interval 50 \
     --use_fp16 \
     --use_tensorboard \
-    --prompt_file human_prompts.txt \
 
 echo "LoRA fine-tuning completed!"
-echo "Check results in: ./output/gaussiancube_finetuning/"
+echo "Check results in: ./output/finetune_smpl_0920_0236/"

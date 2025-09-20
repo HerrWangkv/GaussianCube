@@ -11,11 +11,12 @@ import copy
 import os
 import time
 import glob
-import imageio
+import random
 import contextlib
 import numpy as np
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from PIL import Image
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
@@ -32,7 +33,7 @@ from utils.fp16_util import (
     zero_grad,
 )
 from utils.lpips.lpips import LPIPS
-
+from utils.similarity_loss import CLIPTextImageLoss
 from utils.script_util import build_single_viewpoint_cam, init_volume_grid, create_gaussian_diffusion
 from model.nn import update_ema
 from model.resample import UniformSampler
@@ -43,6 +44,7 @@ from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_d
 from model.unet import UNetModel
 from model.smpl import SMPLinGaussianCube, smpl_to_openpose
 from utils.refiner_openpose_utils import StableDiffusionXLOpenposeRefiner
+from utils.refiner_utils import StableDiffusionXLRefiner
 from gaussian_renderer import render
 
 # Initial loss scale for FP16 training
@@ -50,47 +52,55 @@ INITIAL_LOG_LOSS_SCALE = 20.0
 
 # Model repository mapping (from inference.py)
 MODEL_REPOS = {
-    "objaverse_v1.0": {
-        "repo_id": "BwZhang/GaussianCube-Objaverse",
-        "revision": "main",
-        "model_path": "v1.0/objaverse_ckpt.pt",
-        "mean_path": "v1.0/mean.pt",
-        "std_path": "v1.0/std.pt",
-        "bound": 0.5
-    },
     "objaverse_v1.1": {
         "repo_id": "BwZhang/GaussianCube-Objaverse",
         "revision": "main",
         "model_path": "v1.1/objaverse_ckpt.pt",
         "mean_path": "v1.1/mean.pt",
         "std_path": "v1.1/std.pt",
-        "bound": 0.5
+        "bound": 0.5,
     },
-    "omniobject3d": {
-        "repo_id": "BwZhang/GaussianCube-OmniObject3D-v1.0",
-        "revision": "main",
-        "model_path": "OmniObject3D_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 1.0
-    },
-    "shapenet_car": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetCar-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_car_ckpt.pt", 
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.45
-    },
-    "shapenet_chair": {
-        "repo_id": "BwZhang/GaussianCube-ShapeNetChair-v1.0",
-        "revision": "main",
-        "model_path": "shapenet_chair_ckpt.pt",
-        "mean_path": "mean.pt",
-        "std_path": "std.pt",
-        "bound": 0.35
-    }
 }
+
+
+def generate_human_prompt():
+    races = ["An Asian", "An African", "A Caucasian", "A Mixed-race"]
+    genders = ["man", "woman"]
+    hair_colors = ["black", "brown", "blonde", "red", "gray", "white"]
+    glasses = ["wearing glasses", "wearing no glasses"]
+    cloth_colors = [
+        "red",
+        "blue",
+        "green",
+        "black",
+        "white",
+        "yellow",
+        "purple",
+        "pink",
+        "orange",
+        "gray",
+        "brown",
+    ]
+    tops = [
+        "t-shirt",
+        "shirt",
+        "jacket",
+        "sweater",
+        "hoodie",
+        "coat",
+        "dress",
+        "blouse",
+    ]
+    pants = ["jeans", "trousers", "shorts", "leggings"]
+    shoes = ["sneakers", "boots", "sandals"]
+
+    prompt = (
+        f"{random.choice(races)} {random.choice(genders)} with {random.choice(hair_colors)} hair, "
+        f"{random.choice(glasses)}, wearing a {random.choice(cloth_colors)} {random.choice(tops)}, "
+        f"{random.choice(cloth_colors)} {random.choice(pants)}, and {random.choice(cloth_colors)} {random.choice(shoes)}"
+    )
+
+    return prompt
 
 
 def ignore_stderr(func):
@@ -154,14 +164,14 @@ class LoRAFinetuneLoop:
         diffusion,
         # Training configuration
         batch_size=1,
+        second_stage_step=5000,
         lr=5e-5,
         max_steps=50000,
         use_fp16=True,
         resume_checkpoint=None,
-        prompt_file=None,
         poses_file=None,
         use_tensorboard=True,
-        ema_rate=0.9999,
+        ema_rate=0.999,
         weight_decay=0.0,
         max_grad_norm=1.0,
         fp16_scale_growth=1e-3,
@@ -182,6 +192,7 @@ class LoRAFinetuneLoop:
         lora_exclude_modules=None,
         # Guidance configuration
         timestep_range=(0.3, 0.7),
+        strength=0.5,
         guidance_scale=10.0,
         vram_O=True,
         render_views=4,
@@ -208,12 +219,12 @@ class LoRAFinetuneLoop:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
-            prompt_file: File containing training prompts
             timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
             ... (other parameters similar to TrainLoop)
         """
         # Convert model to LoRA-enabled version
+        self.ema_model = None
         print("Converting model to LoRA-enabled version...")
         self.lora_model = convert_unet_to_lora(
             model,
@@ -238,6 +249,8 @@ class LoRAFinetuneLoop:
         if batch_size != 1:
             raise NotImplementedError("Batch size greater than 1 is not supported.")
         self.batch_size = batch_size
+        self.second_stage_step = second_stage_step
+        self.second_stage = False
         self.lr = lr
         self.ema_rate = (
             [ema_rate]
@@ -269,6 +282,7 @@ class LoRAFinetuneLoop:
         self.guidance_scale = guidance_scale
         self.render_views = render_views
         self.timestep_range = timestep_range
+        self.strength = strength
         self.render_resolution = 768
 
         # Training state
@@ -278,7 +292,11 @@ class LoRAFinetuneLoop:
 
         # Rendering configuration
         self.active_sh_degree = active_sh_degree
-        self.bg_color = th.tensor([1,1,1]).to(th.float32).to(dist_util.dev()) if white_background else th.tensor([0,0,0]).to(th.float32).to(dist_util.dev())
+        self.bg_color = (
+            th.tensor([1, 1, 1]).to(th.float32).to(dist_util.dev())
+            if white_background
+            else None
+        )
         self.std_volume = th.tensor(init_volume_grid(bound=bound, num_pts_each_axis=num_pts_each_axis)).to(th.float32).to(dist_util.dev()).contiguous()
         self.min_elevation, self.max_elevation = elevation_range
         self.min_fovx, self.max_fovx = fovx_range
@@ -296,9 +314,6 @@ class LoRAFinetuneLoop:
         print("Initializing CLIP text encoder for GaussianCube conditioning...")
         self.clip_text_encoder = FrozenCLIPEmbedder()
         self.clip_text_encoder = self.clip_text_encoder.eval().to(dist_util.dev())
-
-        # Load prompts for SDS guidance
-        self.prompts = self._load_prompts(prompt_file)
 
         # Data normalization (same as original)
         if mean_file is not None and std_file is not None:
@@ -360,13 +375,13 @@ class LoRAFinetuneLoop:
         # Load optimizer state if resuming
         if self.resume_step:
             self._load_optimizer_state()
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
-        else:
-            self.ema_params = [
-                copy.deepcopy(self.master_params) for _ in range(len(self.ema_rate))
-            ]
+            if self.resume_step >= self.second_stage_step:
+                self.start_second_stage()
+                self.ema_params = [
+                    self._load_ema_parameters(rate) for rate in self.ema_rate
+                ]
+                if self.ema_params:
+                    self._update_ema_model_params(self.ema_params[0])
 
         # Setup DDP
         if th.cuda.is_available():
@@ -379,6 +394,15 @@ class LoRAFinetuneLoop:
                 bucket_cap_mb=128,
                 find_unused_parameters=False,
             )
+            if self.second_stage:
+                self.ema_ddp_model = DDP(
+                    self.ema_model,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -387,8 +411,11 @@ class LoRAFinetuneLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
+            if self.second_stage:
+                self.ema_ddp_model = self.ema_model
 
         # Loss
+        self.clip = CLIPTextImageLoss(device=dist_util.dev())
         self.vgg = LPIPS(net_type="vgg").to(dist_util.dev()).eval()
 
         # Tensorboard setup
@@ -396,16 +423,16 @@ class LoRAFinetuneLoop:
         if self.use_tensorboard and dist.get_rank() == 0:
             self.writer = logger.Visualizer(os.path.join(logger.get_dir(), 'tf_events'))
 
-    def _load_prompts(self, prompt_file):
-        """Load training prompts from file or use default prompts."""
-        if prompt_file and os.path.exists(prompt_file):
-            with open(prompt_file, 'r') as f:
-                prompts = [line.strip() for line in f.readlines() if line.strip()]
-            print(f"Loaded {len(prompts)} prompts from {prompt_file}")
-        else:
-            raise FileNotFoundError("Prompt file not found, and no default prompts provided.")
-
-        return prompts
+    def start_second_stage(self):
+        self.second_stage = True
+        self.render_resolution = 512
+        self.refiner = StableDiffusionXLRefiner(
+            device=dist_util.dev(),
+            fp16=self.use_fp16,
+            vram_O=True,
+            refiner_strength=self.strength,
+        )
+        self.ema_model = copy.deepcopy(self.model).to(dist_util.dev())
 
     def _load_poses(self, poses_file):
         """Load training poses from file or use default poses."""
@@ -426,6 +453,9 @@ class LoRAFinetuneLoop:
         if processed_resume_checkpoint:
             print("resume checkpoint: ", processed_resume_checkpoint)
             self.resume_step = parse_resume_step_from_filename(processed_resume_checkpoint)
+            print(
+                f"Resuming from checkpoint: {processed_resume_checkpoint} at step {self.resume_step}"
+            )
             if dist.get_rank() == 0:
                 logger.log(f"loading LoRA model from checkpoint: {processed_resume_checkpoint}...")
 
@@ -462,7 +492,7 @@ class LoRAFinetuneLoop:
         """Load optimizer state from checkpoint."""
         main_checkpoint = self.resume_checkpoint
         opt_checkpoint = os.path.join(
-            os.path.dirname(main_checkpoint), f"opt{self.resume_step:06}.pt"
+            os.path.dirname(main_checkpoint), f"lora_opt{self.resume_step:06}.pt"
         )
         if os.path.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
@@ -485,22 +515,29 @@ class LoRAFinetuneLoop:
         """Main training loop."""
         print(f"Starting LoRA fine-tuning with SDXL guidance...")
         print(f"LoRA rank: {self.lora_rank}, alpha: {self.lora_alpha}")
+        print(f"Guidance scale: {self.guidance_scale}")
 
         if dist.get_rank() == 0:
             iterator = trange(
-                self.step, self.max_steps + 1, desc="Training", dynamic_ncols=True
+                self.max_steps + 1,
+                desc="Training",
+                dynamic_ncols=True,
+                initial=self.step + self.resume_step,
             )
         else:
-            iterator = range(self.step, self.max_steps + 1)
+            iterator = range(self.step + self.resume_step, self.max_steps + 1)
         for _ in iterator:
             self.run_step()
-            if self.step % self.log_interval == 0:
+            if self.step + self.resume_step == self.second_stage_step:
+                assert not self.second_stage, "Already in second stage!"
+                self.start_second_stage()
+            if (self.step + self.resume_step) % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+            if (self.step + self.resume_step) % self.save_interval == 0:
                 self.save()
             self.step += 1
 
-        if (self.step - 1) % self.save_interval != 0:
+        if (self.step + self.resume_step - 1) % self.save_interval != 0:
             self.save()
 
     def run_step(self):
@@ -589,17 +626,42 @@ class LoRAFinetuneLoop:
                     else:
                         cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
             cams["cam_prompt"] = prompts_cam_pose
+        face_cam_pose = orbit_camera(
+            0,
+            np.random.uniform(300, 420) % 360,
+            radius=0.5,
+            target=np.array([0, 0.4, 0], dtype=np.float32),
+            opengl=True,
+        )
+        face_cam_pose = convert_mat @ face_cam_pose
+        face_cam = load_cam(
+            c2w=face_cam_pose, orig_image_size=self.render_resolution, fovx=0.5
+        )
+        for k, v in face_cam.items():
+            if not isinstance(v, th.Tensor):
+                if isinstance(v, np.ndarray):
+                    new_tensor = th.from_numpy(np.array([v]))
+                else:
+                    new_tensor = th.tensor([v])
+                cams[k] = th.cat([cams[k], new_tensor], dim=0)
+            else:
+                cams[k] = th.cat([cams[k], v.unsqueeze(0)], dim=0)
+        cams["cam_prompt"].append("face only")
         return cams
 
-    def generate_sds_camera_views(self, pred_x0_denorm):
-        """Generate camera views for SDS loss computation."""
+    def generate_openpose_guided_camera_views(self, pred_x0_denorm):
         predicted_rendered_images = []
         cond_images = []
         # Generate multiple camera viewpoints
         cams = self.load_random_cams(self.render_views)
         cam_prompts = cams.pop("cam_prompt")
-        for view_idx in range(self.render_views):
+        for view_idx in range(self.render_views + 1):
             cam = build_single_viewpoint_cam(cams, view_idx)
+            bg_color = (
+                self.bg_color
+                if self.bg_color is not None
+                else th.rand(3).to(th.float32).to(dist_util.dev())
+            )
             openpose_img, _ = smpl_to_openpose(
                 self.human_model.splats["joints"],
                 cams["full_proj_transform"][view_idx].squeeze(),
@@ -613,7 +675,9 @@ class LoRAFinetuneLoop:
                 .to(th.float32)
                 / 255.0
             )
-            res = render(cam, pred_x0_denorm, self.std_volume, self.bg_color, self.active_sh_degree)
+            res = render(
+                cam, pred_x0_denorm, self.std_volume, bg_color, self.active_sh_degree
+            )
             predicted_rendered_images.append(res["render"])
         return (
             th.stack(predicted_rendered_images, dim=0),
@@ -621,19 +685,47 @@ class LoRAFinetuneLoop:
             cam_prompts,
         )
 
+    def generate_guided_camera_views(self, pred_x0_denorm, denoised_denorm):
+        predicted_rendered_images = []
+        denoised_rendered_images = []
+        cams = self.load_random_cams(self.render_views)
+        cam_prompts = cams.pop("cam_prompt")
+        for view_idx in range(self.render_views + 1):
+            cam = build_single_viewpoint_cam(cams, view_idx)
+            bg_color = (
+                self.bg_color
+                if self.bg_color is not None
+                else th.rand(3).to(th.float32).to(dist_util.dev())
+            )
+            res = render(
+                cam, pred_x0_denorm, self.std_volume, bg_color, self.active_sh_degree
+            )
+            predicted_rendered_images.append(res["render"])
+            res = render(
+                cam, denoised_denorm, self.std_volume, bg_color, self.active_sh_degree
+            )
+            denoised_rendered_images.append(res["render"])
+        return (
+            th.stack(predicted_rendered_images, dim=0),
+            th.stack(denoised_rendered_images, dim=0),
+            cam_prompts,
+        )
+
     @ignore_stderr
-    def compute_loss(self, pred_x0_denorm, prompt, save_guidance_path=None):
-        """Compute SDS loss for the predicted x0, with optional LPIPS regularization.
+    def compute_openpose_guided_loss(
+        self, pred_x0_denorm, prompt, save_guidance_path=None
+    ):
+        """Compute OpenPose guided loss for the predicted x0, with optional LPIPS regularization.
         Also computes reference output using the original (non-LoRA) model without gradients.
         """
         # Generate multiple camera views of the 3D object (LoRA model)
         predicted_rendered_views, cond_images, cam_prompts = (
-            self.generate_sds_camera_views(pred_x0_denorm)
+            self.generate_openpose_guided_camera_views(pred_x0_denorm)
         )
         refined_tensors = self.refiner.refine_images(
             cond_images=cond_images,
             prompts=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
-            negative_prompts=[""] * self.render_views,
+            negative_prompts=[""] * len(cam_prompts),
             guidance_scale=self.guidance_scale,
             output_type="pt",
         )
@@ -663,7 +755,65 @@ class LoRAFinetuneLoop:
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
         vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
-        return vgg_loss
+        clip_loss = self.clip(
+            predicted_rendered_views,
+            [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
+        )
+        return {"vgg": vgg_loss, "clip": clip_loss}
+
+    @ignore_stderr
+    def compute_guided_loss(
+        self, pred_x0_denorm, denoised_denorm, prompt, save_guidance_path=None
+    ):
+        """Compute guided loss for the predicted x0, with optional LPIPS regularization.
+        Also computes reference output using the ema (non-LoRA) model without gradients.
+        """
+        # Generate multiple camera views of the 3D object (LoRA model)
+        predicted_rendered_views, denoised_rendered_views, cam_prompts = (
+            self.generate_guided_camera_views(pred_x0_denorm, denoised_denorm)
+        )
+        refined_output = self.refiner.refine_images(
+            images=denoised_rendered_views,
+            prompt=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
+            negative_prompt=[""] * len(cam_prompts),
+            guidance_scale=self.guidance_scale,
+            output_type="pt",
+        )
+        if isinstance(refined_output, dict):
+            refined_tensors = refined_output["images"]
+        else:
+            refined_tensors = refined_output
+        if save_guidance_path:
+            # Save rendered views and refined images side by side for visualization
+            # Each row: [rendered_view | refined_image]
+            predicted_rendered_np = predicted_rendered_views.detach().cpu().numpy()
+            denoised_rendered_np = denoised_rendered_views.detach().cpu().numpy()
+            refined_np = refined_tensors.detach().cpu().numpy()
+            rows = []
+            for i in range(predicted_rendered_np.shape[0]):
+                # Convert to uint8 images
+                predicted_rendered_img = (
+                    np.clip(predicted_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                denoised_rendered_img = (
+                    np.clip(denoised_rendered_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                refined_img = (
+                    np.clip(refined_np[i].transpose(1, 2, 0), 0, 1) * 255
+                ).astype(np.uint8)
+                row = np.concatenate(
+                    [predicted_rendered_img, denoised_rendered_img, refined_img], axis=1
+                )
+                rows.append(row)
+            # Stack all rows vertically
+            out_img = np.concatenate(rows, axis=0)
+            Image.fromarray(out_img).save(save_guidance_path)
+        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
+        clip_loss = self.clip(
+            predicted_rendered_views,
+            [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
+        )
+        return {"vgg": vgg_loss, "clip": clip_loss}
 
     def forward_backward(self):
         """Forward and backward pass with SDS loss only."""
@@ -680,7 +830,7 @@ class LoRAFinetuneLoop:
         noise = th.randn(shape, device=dist_util.dev(), dtype=th.float32)
 
         # Select random prompt
-        prompt = np.random.choice(self.prompts)
+        prompt = generate_human_prompt()
 
         # Get text embeddings for GaussianCube diffusion conditioning
         clip_text_embeds = self.clip_text_encoder.encode(
@@ -717,9 +867,10 @@ class LoRAFinetuneLoop:
             # Run inference from t=1.0 to some intermediate point
             # This gives us a partially denoised sample
             # Lower values = more denoised (less noise), Higher values = more noisy
-            intermediate_t = np.random.uniform(
-                *self.timestep_range
-            )  # Random intermediate timestep
+            u = np.random.beta(3, 1)
+            intermediate_t = self.timestep_range[0] + u * (
+                self.timestep_range[1] - self.timestep_range[0]
+            )
             partially_denoised = dpm_solver.sample(
                 x=noise,
                 steps=100,
@@ -753,7 +904,29 @@ class LoRAFinetuneLoop:
             "model_output": model_output_mean,
             "x_t": partially_denoised,
         }
-
+        if self.second_stage:
+            ema_model_fn = model_wrapper(
+                self.ema_ddp_model,  # Use DDP model consistently
+                self.noise_schedule,
+                model_type="x_start",
+                model_kwargs={"cond_text": clip_text_embeds},
+            )
+            with th.no_grad():
+                ema_dpm_solver = DPM_Solver(
+                    ema_model_fn,
+                    self.noise_schedule,
+                    algorithm_type="dpmsolver++",
+                    correcting_xt_fn=correcting_xt_fn,
+                )
+                denoised = ema_dpm_solver.sample(
+                    x=noise,
+                    steps=100,
+                    t_start=1.0,
+                    t_end=1.0 / self.diffusion.num_timesteps,
+                    order=2,
+                    skip_type="time_uniform",
+                    method="multistep",
+                )
         # Get predicted x0 for SDS loss computation
         pose = self.poses[th.randint(0,self.poses.shape[0], (1,))[0]]
         global_orient = pose[:3].view(1, -1)
@@ -764,19 +937,37 @@ class LoRAFinetuneLoop:
         self.human_model.update_rest_attributes(pred_x0_denorm[0])
         self.human_model.apply_pose(body_pose=body_pose, global_orient=global_orient)
         pred_x0_denorm = self.human_model.to_x0_denorm()
+        if self.second_stage:
+            denoised = denoised * self.std + self.mean
+            self.human_model.update_rest_attributes(denoised[0])
+            denoised_denorm = self.human_model.to_x0_denorm()
 
         # Compute loss using the predicted x0
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
             s_path = os.path.join(logger.get_dir(), "images")
             os.makedirs(s_path, exist_ok=True)
-            guidance_path = os.path.join(s_path, f"{self.step:08d}.png")
-            total_loss = self.compute_loss(
-                pred_x0_denorm,
-                prompt,
-                save_guidance_path=guidance_path,
+            guidance_path = os.path.join(
+                s_path, f"{self.step + self.resume_step:08d}_{prompt}.png"
             )
+            if not self.second_stage:
+                loss = self.compute_openpose_guided_loss(
+                    pred_x0_denorm,
+                    prompt,
+                    save_guidance_path=guidance_path,
+                )
+            else:
+                loss = self.compute_guided_loss(
+                    pred_x0_denorm,
+                    denoised_denorm,
+                    prompt,
+                    save_guidance_path=guidance_path,
+                )
         else:
-            total_loss = self.compute_loss(pred_x0_denorm, prompt)
+            if not self.second_stage:
+                loss = self.compute_openpose_guided_loss(pred_x0_denorm, prompt)
+            else:
+                loss = self.compute_guided_loss(pred_x0_denorm, denoised_denorm, prompt)
+        total_loss = loss["vgg"] + 0.1 * loss["clip"]
 
         # Log losses (skip timestep-based logging since we don't have batch structure)
         logger.logkv_mean("total_loss", total_loss.item())
@@ -787,7 +978,8 @@ class LoRAFinetuneLoop:
         # Tensorboard logging
         if self.use_tensorboard and self.step % self.log_interval == 0 and dist.get_rank() == 0:
             log_dict = {
-                "total_loss": total_loss.item(),
+                "vgg_loss": loss["vgg"],
+                "clip_loss": loss["clip"],
                 "intermediate_t": intermediate_t,
                 "final_timestep": int(final_timestep[0]),
             }
@@ -819,9 +1011,11 @@ class LoRAFinetuneLoop:
         self.opt.step()
         self.warmup_scheduler.step()
         logger.logkv_mean("lr", self.opt.param_groups[0]["lr"])
-
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.master_params, rate=rate)
+        if self.second_stage:
+            for rate, params in zip(self.ema_rate, self.ema_params):
+                update_ema(params, self.master_params, rate=rate)
+            if self.ema_params:
+                self._update_ema_model_params(self.ema_params[0])
         master_params_to_model_params(self.model_params, self.master_params)
         self.lg_loss_scale += self.fp16_scale_growth
 
@@ -837,8 +1031,11 @@ class LoRAFinetuneLoop:
         self.warmup_scheduler.step()
         logger.logkv_mean("lr", self.opt.param_groups[0]["lr"])
 
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.master_params, rate=rate)
+        if self.second_stage:
+            for rate, params in zip(self.ema_rate, self.ema_params):
+                update_ema(params, self.master_params, rate=rate)
+            if self.ema_params:
+                self._update_ema_model_params(self.ema_params[0])
 
     def _log_grad_norm(self):
         """Log gradient norms."""
@@ -851,6 +1048,25 @@ class LoRAFinetuneLoop:
     def _anneal_lr(self):
         """Learning rate annealing (placeholder)."""
         return
+
+    def _update_ema_model_params(self, ema_params):
+        """Update the EMA model's LoRA parameters with the latest EMA parameters."""
+        if self.use_fp16:
+            # Convert master params to model params for FP16
+            ema_model_params = unflatten_master_params(self.model_params, ema_params)
+        else:
+            ema_model_params = ema_params
+        # Update EMA model's LoRA parameters only
+        param_idx = 0
+        for name, param in self.ema_model.named_parameters():
+            # Only update LoRA parameters
+            if any(
+                param is lora_param
+                for lora_param in self.ema_model.get_lora_parameters()
+            ):
+                if param_idx < len(ema_model_params):
+                    param.data.copy_(ema_model_params[param_idx].data)
+                    param_idx += 1
 
     def log_step(self):
         """Log step information."""
@@ -881,8 +1097,9 @@ class LoRAFinetuneLoop:
         save_checkpoint(0, self.master_params)
 
         # Save EMA models
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            save_checkpoint(rate, params)
+        if self.second_stage:
+            for rate, params in zip(self.ema_rate, self.ema_params):
+                save_checkpoint(rate, params)
 
         # Save LoRA weights separately
         if dist.get_rank() == 0:
@@ -946,7 +1163,9 @@ def parse_resume_step_from_filename(filename):
     assert(filename.endswith(".pt"))
     filename=filename[:-3]
     if filename.startswith("model") or filename.startswith("lora_model"):
-        split = filename.split("_")[-1] if "lora_model" in filename else filename[5:]
+        split = (
+            filename.split("_")[-1][5:] if "lora_model" in filename else filename[5:]
+        )
     elif filename.startswith("ema") or filename.startswith("lora_ema"):
         split = filename.split("_")[-1]
     else:
@@ -1019,16 +1238,24 @@ def create_argparser():
     # Training configuration
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Training batch size (must be 1)")
+    parser.add_argument(
+        "--second_stage_step",
+        type=int,
+        default=5000,
+        help="Step at which to start second stage",
+    )
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="Learning rate for LoRA parameters")
     parser.add_argument("--max_steps", type=int, default=50000,
                         help="Maximum training steps")
     parser.add_argument("--use_fp16", action="store_true",
                         help="Use mixed precision training")
-    parser.add_argument("--resume_checkpoint", type=str, default=None,
-                        help="Path to resume LoRA checkpoint")
-    parser.add_argument("--prompt_file", type=str, required=True,
-                    help="Path to file containing training prompts")
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+        help="Path to resume LoRA checkpoint",
+    )
     parser.add_argument("--poses_file", type=str, default="smpl/B1 - stand to walk_poses.npz",
                     help="Path to file containing training poses")
     parser.add_argument("--use_tensorboard", action="store_true",
@@ -1108,7 +1335,6 @@ def main():
         max_steps=args.max_steps,
         use_fp16=args.use_fp16,
         resume_checkpoint=args.resume_checkpoint,
-        prompt_file=args.prompt_file,
         poses_file=args.poses_file,
         use_tensorboard=args.use_tensorboard,
         mean_file=mean_file,

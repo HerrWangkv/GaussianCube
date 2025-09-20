@@ -437,29 +437,30 @@ def smpl_to_openpose(
 
 
 class SMPL:
+
     def __init__(
         self,
         model_path,
         global_orient=[math.pi / 2, 0.0, 0.0],
         transl=[0.0, 0.0, 0.0],
+        betas=None,
         device="cuda",
     ):
         self.model = smplx.create(
             model_path,
             model_type="smpl",
-            gender="NEUTRAL",
-            ext="pkl",
-            use_pca=False,
             batch_size=1,
         ).to(device)
         self.device = device
-        betas = torch.zeros([1, 10], device=device)  # shape
+        self.betas = (
+            torch.zeros([1, 10], device=device) if betas is None else betas.to(device)
+        )
         self.body_pose = torch.zeros([1, 69], device=device)  # 23*3 axis-angle
         self.global_orient = torch.tensor([global_orient], device=device)  # stand up
         self.transl = torch.tensor([transl], device=device)
         with torch.no_grad():
             out = self.model(
-                betas=betas,
+                betas=self.betas,
                 body_pose=self.body_pose,
                 global_orient=self.global_orient,
                 transl=self.transl,
@@ -508,7 +509,7 @@ class SMPL:
         device = self.device
         with torch.no_grad():
             out = self.model(
-                betas=torch.zeros([1, 10], device=device),
+                betas=self.betas,
                 body_pose=self.body_pose,
                 global_orient=self.global_orient,
                 transl=self.transl,
@@ -545,8 +546,17 @@ class SMPL:
 
 
 class SMPLinGaussianCube:
-    def __init__(self, model_path, std_volume, gc_mean, gc_std, device):
-        self.smpl = SMPL(model_path, device=device)
+
+    def __init__(
+        self,
+        model_path,
+        std_volume,
+        gc_mean,
+        gc_std,
+        device,
+        betas=None,
+    ):
+        self.smpl = SMPL(model_path, device=device, betas=betas)
         self.device = device
         self.splats = self.smpl.normalize()  # real splats
         self.std_volume = std_volume
@@ -617,12 +627,13 @@ class SMPLinGaussianCube:
         # )
         # self.initial_x0 = self.initial_x0.unsqueeze(0)
 
-    def update_rest_attributes(self, x0_denorm):
+    def update_rest_attributes(self, x0_denorm, assignments=None):
         """
         x0_denorm: (num_channels, voxel_size, voxel_size, voxel_size)
         """
         x0_denorm = x0_denorm.permute(1, 2, 3, 0).reshape(-1, self.num_channels)
-        self.splats["colors"] = x0_denorm[self.assignments, 3 : self.num_channels - 8]
+        assignments = self.assignments if assignments is None else assignments
+        self.splats["colors"] = x0_denorm[assignments, 3 : self.num_channels - 8]
         self.smpl.update_rest_attributes(colors=self.splats["colors"])
 
     def apply_pose(self, body_pose=None, global_orient=None, transl=None):
