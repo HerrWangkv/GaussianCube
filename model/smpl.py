@@ -552,6 +552,7 @@ class SMPLinGaussianCube:
         gc_std,
         device,
         betas=None,
+        assign=True,
     ):
         self.smpl = SMPL(model_path, device=device, betas=betas)
         self.device = device
@@ -563,73 +564,52 @@ class SMPLinGaussianCube:
         self.voxel_size = int(np.round(N ** (1 / 3)))
         assert self.voxel_size**3 == N
         self.num_channels = len(gc_mean)
-        self.assignments = recursive_unique_assignment(
-            self.splats["means"], std_volume + std_volume_offsets, device=device
-        )
-        self.inversed_assignments = invert_assignments(
-            self.assignments, len(std_volume)
-        )
-        matched_voxel_mask = self.inversed_assignments != -1
-        matched_splat_indices = self.inversed_assignments[matched_voxel_mask]
-
-        self.fixed_x0 = torch.ones((N, self.num_channels), device=device) * torch.nan
-        self.fixed_x0[:, -8] = 0.0  # opacity set as 0
-        self.fixed_x0[matched_voxel_mask] = torch.cat(
-            [
-                self.splats["means"][matched_splat_indices]
-                - std_volume[matched_voxel_mask],  # fixed
-                torch.ones(M, self.num_channels - 11, device=device)
-                * torch.nan,  # to be generated
-                self.splats["opacities"][matched_splat_indices],  # fixed
-                self.splats["scales"][matched_splat_indices],  # fixed
-                self.splats["quats"][matched_splat_indices],  # fixed
-            ],
-            dim=1,
-        )
-        # self.initial_x0 = torch.ones((N, self.num_channels), device=device) * torch.nan
-        # self.initial_x0[matched_voxel_mask] = torch.cat(
-        #     [
-        #         torch.ones(M, 3, device=device) * torch.nan,  # already fixed
-        #         torch.ones(M, self.num_channels - 11, device=device)
-        #         * torch.nan,  # to be generated
-        #         torch.ones(M, 1, device=device) * torch.nan,  # already fixed
-        #         self.splats["scales"][matched_splat_indices],  # initial values
-        #         self.splats["quats"][matched_splat_indices],  # initial values
-        #     ],
-        #     dim=1,
-        # )
-        # assert not torch.logical_and(
-        #     ~self.fixed_x0.isnan(), ~self.initial_x0.isnan()
-        # ).any()
-        self.fixed_x0 = (
-            self.fixed_x0 - gc_mean.view(self.num_channels, -1).T
-        ) / gc_std.view(self.num_channels, -1).T
-        self.fixed_x0 = (
-            self.fixed_x0.view(
-                self.voxel_size, self.voxel_size, self.voxel_size, self.num_channels
+        if assign:
+            self.assignments = recursive_unique_assignment(
+                self.splats["means"], std_volume + std_volume_offsets, device=device
             )
-            .permute(3, 0, 1, 2)
-            .contiguous()
-        )
-        self.fixed_x0 = self.fixed_x0.unsqueeze(0)
-        # self.initial_x0 = (
-        #     self.initial_x0 - gc_mean.view(self.num_channels, -1).T
-        # ) / gc_std.view(self.num_channels, -1).T
-        # self.initial_x0 = (
-        #     self.initial_x0.view(
-        #         self.voxel_size, self.voxel_size, self.voxel_size, self.num_channels
-        #     )
-        #     .permute(3, 0, 1, 2)
-        #     .contiguous()
-        # )
-        # self.initial_x0 = self.initial_x0.unsqueeze(0)
+            self.inversed_assignments = invert_assignments(
+                self.assignments, len(std_volume)
+            )
+            matched_voxel_mask = self.inversed_assignments != -1
+            matched_splat_indices = self.inversed_assignments[matched_voxel_mask]
+
+            self.fixed_x0 = (
+                torch.ones((N, self.num_channels), device=device) * torch.nan
+            )
+            self.fixed_x0[:, -8] = 0.0  # opacity set as 0
+            self.fixed_x0[matched_voxel_mask] = torch.cat(
+                [
+                    self.splats["means"][matched_splat_indices]
+                    - std_volume[matched_voxel_mask],  # fixed
+                    torch.ones(M, self.num_channels - 11, device=device)
+                    * torch.nan,  # to be generated
+                    self.splats["opacities"][matched_splat_indices],  # fixed
+                    self.splats["scales"][matched_splat_indices],  # fixed
+                    self.splats["quats"][matched_splat_indices],  # fixed
+                ],
+                dim=1,
+            )
+            self.fixed_x0 = (
+                self.fixed_x0 - gc_mean.view(self.num_channels, -1).T
+            ) / gc_std.view(self.num_channels, -1).T
+            self.fixed_x0 = (
+                self.fixed_x0.view(
+                    self.voxel_size, self.voxel_size, self.voxel_size, self.num_channels
+                )
+                .permute(3, 0, 1, 2)
+                .contiguous()
+            )
+            self.fixed_x0 = self.fixed_x0.unsqueeze(0)
 
     def update_rest_attributes(self, x0_denorm, assignments=None):
         """
         x0_denorm: (num_channels, voxel_size, voxel_size, voxel_size)
         """
         x0_denorm = x0_denorm.permute(1, 2, 3, 0).reshape(-1, self.num_channels)
-        assignments = self.assignments if assignments is None else assignments
+        if assignments is None:
+            assert hasattr(self, "assignments"), "No precomputed assignments found."
+            assignments = self.assignments
         self.splats["colors"] = x0_denorm[assignments, 3 : self.num_channels - 8]
         self.smpl.update_rest_attributes(colors=self.splats["colors"])
 
@@ -643,10 +623,16 @@ class SMPLinGaussianCube:
         )
         self.splats.update(self.smpl.normalize())
 
-    def to_x0_denorm(self):
+    def to_x0_denorm(self, inversed_assignments=None):
         x0_denorm = torch.zeros((self.N, self.num_channels), device=self.device)
-        matched_voxel_mask = self.inversed_assignments != -1
-        matched_splat_indices = self.inversed_assignments[matched_voxel_mask]
+        if inversed_assignments is None:
+            assert hasattr(
+                self, "inversed_assignments"
+            ), "No precomputed inversed assignments found."
+            inversed_assignments = self.inversed_assignments
+
+        matched_voxel_mask = inversed_assignments != -1
+        matched_splat_indices = inversed_assignments[matched_voxel_mask]
         x0_denorm[matched_voxel_mask] = torch.cat(
             [
                 self.splats["means"][matched_splat_indices]

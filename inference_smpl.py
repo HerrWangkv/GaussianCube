@@ -14,6 +14,7 @@ from model.dpmsolver import NoiseScheduleVP, model_wrapper, DPM_Solver, expand_d
 from model.smpl import SMPLinGaussianCube, smpl_to_openpose
 from model.lora_unet import convert_unet_to_lora
 from utils import dist_util, logger
+from utils.prompt_util import generate_human_prompt
 from utils.script_util import create_gaussian_diffusion, init_volume_grid, build_single_viewpoint_cam
 from dataset.dataset_render import load_data
 from gaussian_renderer import render
@@ -39,47 +40,6 @@ MODEL_REPOS = {
         "bound": 0.5
     },
 }
-
-
-def generate_human_prompt():
-    races = ["An Asian", "An African", "A Caucasian", "A Mixed-race"]
-    genders = ["man", "woman"]
-    hair_colors = ["black", "brown", "blonde", "red", "gray", "white"]
-    glasses = ["wearing glasses", "wearing no glasses"]
-    cloth_colors = [
-        "red",
-        "blue",
-        "green",
-        "black",
-        "white",
-        "yellow",
-        "purple",
-        "pink",
-        "orange",
-        "gray",
-        "brown",
-    ]
-    tops = [
-        "t-shirt",
-        "shirt",
-        "jacket",
-        "sweater",
-        "hoodie",
-        "coat",
-        "dress",
-        "blouse",
-    ]
-    pants = ["jeans", "trousers", "shorts", "leggings"]
-    shoes = ["sneakers", "boots", "sandals"]
-
-    prompt = (
-        f"{random.choice(races)} {random.choice(genders)} with {random.choice(hair_colors)} hair, "
-        f"{random.choice(glasses)}, wearing a {random.choice(cloth_colors)} {random.choice(tops)}, "
-        f"{random.choice(cloth_colors)} {random.choice(pants)}, and {random.choice(cloth_colors)} {random.choice(shoes)}"
-    )
-
-    return prompt
-
 
 def download_model_files(model_name):
     """Download model files from Hugging Face Hub."""
@@ -205,6 +165,7 @@ def main():
             gc_std=std,
             device=dist_util.dev(),
             betas=torch.randn([1, 10]),
+            assign=False,
         )
     else:
         actual_human_model = SMPLinGaussianCube(
@@ -214,6 +175,7 @@ def main():
             gc_std=std,
             device=dist_util.dev(),
             betas=torch.randn([1, 10]),
+            assign=False,
         )
     fixed_x0 = neutral_human_model.fixed_x0
     # initial_x0 = neutral_human_model.initial_x0
@@ -285,7 +247,9 @@ def main():
                 actual_human_model.apply_pose(
                     body_pose=new_body_pose, global_orient=new_global_orient
                 )
-                new_samples_denorm = actual_human_model.to_x0_denorm()
+                new_samples_denorm = actual_human_model.to_x0_denorm(
+                    neutral_human_model.inversed_assignments
+                )
                 for i, cam_info in enumerate(model_kwargs["cams"]):
                     # if pose_id % len(model_kwargs["cams"]) != i:
                     #     continue
@@ -355,7 +319,7 @@ def create_argparser():
     parser.add_argument(
         "--lora_checkpoint",
         type=str,
-        default=None,
+        default="lora_ckpts/smpl.pt",
         help="Path to LoRA checkpoint to apply (optional)",
     )
 
