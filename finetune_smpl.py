@@ -67,7 +67,7 @@ def generate_human_prompt():
     races = ["An Asian", "An African", "A Caucasian", "A Mixed-race"]
     genders = ["man", "woman"]
     hair_colors = ["black", "brown", "blonde", "red", "gray", "white"]
-    glasses = ["wearing glasses", "wearing no glasses"]
+    glasses = ["wearing glasses", "no glasses"]
     cloth_colors = [
         "red",
         "blue",
@@ -164,7 +164,7 @@ class LoRAFinetuneLoop:
         diffusion,
         # Training configuration
         batch_size=1,
-        second_stage_step=5000,
+        second_stage_step=2000,
         lr=5e-5,
         max_steps=50000,
         use_fp16=True,
@@ -280,6 +280,7 @@ class LoRAFinetuneLoop:
 
         # Guidance configuration
         self.guidance_scale = guidance_scale
+        self.vram_O = vram_O
         self.render_views = render_views
         self.timestep_range = timestep_range
         self.strength = strength
@@ -307,7 +308,7 @@ class LoRAFinetuneLoop:
         self.refiner = StableDiffusionXLOpenposeRefiner(
             device=dist_util.dev(),
             fp16=use_fp16,
-            vram_O=vram_O,
+            vram_O=self.vram_O,
         )
 
         # Initialize CLIP text encoder for GaussianCube diffusion conditioning
@@ -429,7 +430,7 @@ class LoRAFinetuneLoop:
         self.refiner = StableDiffusionXLRefiner(
             device=dist_util.dev(),
             fp16=self.use_fp16,
-            vram_O=True,
+            vram_O=self.vram_O,
             refiner_strength=self.strength,
         )
         self.ema_model = copy.deepcopy(self.model).to(dist_util.dev())
@@ -527,10 +528,12 @@ class LoRAFinetuneLoop:
         else:
             iterator = range(self.step + self.resume_step, self.max_steps + 1)
         for _ in iterator:
-            self.run_step()
-            if self.step + self.resume_step == self.second_stage_step:
-                assert not self.second_stage, "Already in second stage!"
+            if (
+                self.step + self.resume_step == self.second_stage_step
+                and not self.second_stage
+            ):
                 self.start_second_stage()
+            self.run_step()
             if (self.step + self.resume_step) % self.log_interval == 0:
                 logger.dumpkvs()
             if (self.step + self.resume_step) % self.save_interval == 0:
@@ -775,7 +778,8 @@ class LoRAFinetuneLoop:
         refined_output = self.refiner.refine_images(
             images=denoised_rendered_views,
             prompt=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
-            negative_prompt=[""] * len(cam_prompts),
+            negative_prompt=["glasses" if "no glasses" in prompt else "no glasses"]
+            * len(cam_prompts),
             guidance_scale=self.guidance_scale,
             output_type="pt",
         )
@@ -1241,7 +1245,7 @@ def create_argparser():
     parser.add_argument(
         "--second_stage_step",
         type=int,
-        default=5000,
+        default=2000,
         help="Step at which to start second stage",
     )
     parser.add_argument("--lr", type=float, default=5e-5,
