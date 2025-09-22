@@ -136,51 +136,48 @@ def compute_vertex_normals(vertices_np, faces_np):
     normals = torch.nn.functional.normalize(normals, dim=1).cpu().numpy()
     return normals
 
-
 def build_vertex_gaussians(vertices_np, faces_np, min_scale=0.002, max_scale=0.05, device="cuda"):
     V = vertices_np.shape[0]
-    # adjacency for average edge length
-    neighbors = [[] for _ in range(V)]
-    for f in faces_np:
-        a, b, c = f
-        neighbors[a] += [b, c]
-        neighbors[b] += [a, c]
-        neighbors[c] += [a, b]
 
+    # --- avg edge lengths (vectorized) ---
+    edges = np.concatenate(
+        [faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]], axis=0
+    )
+    edge_vecs = vertices_np[edges[:, 0]] - vertices_np[edges[:, 1]]
+    edge_lens = np.linalg.norm(edge_vecs, axis=1)
+    sum_len = np.bincount(edges[:, 0], weights=edge_lens, minlength=V) + np.bincount(
+        edges[:, 1], weights=edge_lens, minlength=V
+    )
+    count_len = np.bincount(edges[:, 0], minlength=V) + np.bincount(
+        edges[:, 1], minlength=V
+    )
+    avg_len = sum_len / (count_len + 1e-9)
+    avg_len = avg_len / 2.0
+    avg_len[count_len == 0] = 0.005
+
+    # --- scales ---
+    v_scales = np.stack([avg_len, avg_len, avg_len * 0.2], axis=1).astype(np.float32)
+    v_scales = np.clip(v_scales, min_scale, max_scale)
+
+    # --- normals ---
     normals = compute_vertex_normals(vertices_np, faces_np)
 
-    v_means, v_scales, v_quats = [], [], []
-    for i in range(V):
-        center = vertices_np[i]
-        if neighbors[i]:
-            neigh = vertices_np[neighbors[i]]
-            avg_len = np.mean(np.linalg.norm(neigh - center, axis=1)) / 2
-        else:
-            avg_len = 0.005
-
-        scale = np.array([avg_len, avg_len, avg_len * 0.2], dtype=np.float32)
-        scale = np.clip(scale, min_scale, max_scale)
-
-        # Build rotation frame: z = normal; construct orthonormal basis
-        z = normals[i] / (np.linalg.norm(normals[i]) + 1e-9)
-        tmp = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        if abs(np.dot(z, tmp)) > 0.9:
-            tmp = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        y = np.cross(z, tmp)
-        y /= (np.linalg.norm(y) + 1e-9)
-        x = np.cross(y, z)
-        Rmat = np.stack([x, y, z], axis=1)  # columns are basis vectors
-        quat_xyzw = R.from_matrix(Rmat).as_quat().astype(np.float32)  # xyzw
-        quat_wxyz = quat_xyzw[[3, 0, 1, 2]]
-
-        v_means.append(center.astype(np.float32))
-        v_scales.append(scale)
-        v_quats.append(quat_wxyz)
+    # --- rotation frames ---
+    z = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-9)
+    tmp = np.tile(np.array([1.0, 0.0, 0.0], dtype=np.float32), (V, 1))
+    mask = np.abs((z * tmp).sum(axis=1)) > 0.9
+    tmp[mask] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    y = np.cross(z, tmp)
+    y /= np.linalg.norm(y, axis=1, keepdims=True) + 1e-9
+    x = np.cross(y, z)
+    Rmat = np.stack([x, y, z], axis=2)
+    quat_xyzw = R.from_matrix(Rmat).as_quat().astype(np.float32)
+    quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
 
     return (
-        torch.tensor(np.vstack(v_means), device=device),
-        torch.tensor(np.vstack(v_scales), device=device),
-        torch.tensor(np.vstack(v_quats), device=device),
+        torch.tensor(vertices_np.astype(np.float32), device=device),
+        torch.tensor(v_scales, device=device),
+        torch.tensor(quat_wxyz, device=device),
     )
 
 
