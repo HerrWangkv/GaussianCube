@@ -152,7 +152,6 @@ class LoRAFinetuneLoop:
         lora_target_modules=None,
         lora_exclude_modules=None,
         # Guidance configuration
-        timestep_range=(0.3, 0.7),
         strength=0.5,
         guidance_scale=10.0,
         vram_O=True,
@@ -180,7 +179,6 @@ class LoRAFinetuneLoop:
             lora_alpha: LoRA alpha scaling
             lora_dropout: LoRA dropout rate
             lora_target_modules: Target modules for LoRA adaptation
-            timestep_range: Range (min, max) for random intermediate timestep selection
             image_save_interval: Interval for saving training images
             ... (other parameters similar to TrainLoop)
         """
@@ -243,7 +241,6 @@ class LoRAFinetuneLoop:
         self.guidance_scale = guidance_scale
         self.vram_O = vram_O
         self.render_views = render_views
-        self.timestep_range = timestep_range
         self.strength = strength
         self.render_resolution = 768
 
@@ -718,7 +715,7 @@ class LoRAFinetuneLoop:
             # Stack all rows vertically
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
+        vgg_loss = self.vgg(predicted_rendered_views * 2 - 1, refined_tensors * 2 - 1)
         clip_loss = self.clip(
             predicted_rendered_views,
             [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
@@ -773,11 +770,14 @@ class LoRAFinetuneLoop:
             # Stack all rows vertically
             out_img = np.concatenate(rows, axis=0)
             Image.fromarray(out_img).save(save_guidance_path)
-        vgg_loss = self.vgg(refined_tensors * 2 - 1, predicted_rendered_views * 2 - 1)
         clip_loss = self.clip(
             predicted_rendered_views,
             [prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
         )
+        predicted_rendered_views = th.stack(
+            [predicted_rendered_views, denoised_rendered_views.detach()], dim=0
+        )
+        vgg_loss = self.vgg(predicted_rendered_views * 2 - 1, refined_tensors * 2 - 1)
         return {"vgg": vgg_loss, "clip": clip_loss}
 
     def forward_backward(self):
@@ -801,65 +801,17 @@ class LoRAFinetuneLoop:
         clip_text_embeds = self.clip_text_encoder.encode(
             prompt
         )  # Shape: [1, seq_len, embed_dim]
-
-        # Create model wrapper for inference (put conditioning in model_kwargs)
-        model_fn = model_wrapper(
-            self.ddp_model,  # Use DDP model consistently
-            self.noise_schedule,
-            model_type="x_start",
-            model_kwargs={"cond_text": clip_text_embeds},
-        )
-        def correcting_xt_fn(xt, t, step=None, factor=1.0):
-            alpha_t, sigma_t = self.noise_schedule.marginal_alpha(
-                t
-            ), self.noise_schedule.marginal_std(t)
-            noise = th.randn_like(xt)
-            noisy_fixed_x0 = (
-                expand_dims(alpha_t, xt.dim()) * self.fixed_x0
-                + expand_dims(sigma_t, xt.dim()) * noise
-            )
-            xt_new = xt.clone()
-            xt_new[~th.isnan(noisy_fixed_x0)] = noisy_fixed_x0[
-                ~th.isnan(noisy_fixed_x0)
-            ]
-            return xt_new
-        # Step 1: Run partial inference WITHOUT gradients to get partially denoised sample
-        with th.no_grad():
-            dpm_solver = DPM_Solver(
-                model_fn, self.noise_schedule, algorithm_type="dpmsolver++", correcting_xt_fn=correcting_xt_fn
-            )
-
-            # Run inference from t=1.0 to some intermediate point
-            # This gives us a partially denoised sample
-            # Lower values = more denoised (less noise), Higher values = more noisy
-            u = np.random.beta(3, 1)
-            intermediate_t = self.timestep_range[0] + u * (
-                self.timestep_range[1] - self.timestep_range[0]
-            )
-            partially_denoised = dpm_solver.sample(
-                x=noise,
-                steps=100,
-                t_start=1.0,
-                t_end=intermediate_t,
-                order=2,
-                skip_type="time_uniform",
-                method="multistep",
-            )
-        # Step 2: Now predict x0 from the partially denoised sample WITH gradients
-        # Convert intermediate_t back to discrete timestep
-        final_timestep = th.tensor([int(intermediate_t * self.diffusion.num_timesteps)], device=dist_util.dev())
-
-        # This time we need gradients for the SDS loss
-        partially_denoised = correcting_xt_fn(partially_denoised, th.tensor(intermediate_t, device=dist_util.dev()), factor=1.0)
         model_output = self.ddp_model(
-            partially_denoised, final_timestep, cond_text=clip_text_embeds
+            noise,
+            th.tensor([999] * len(noise), device=dist_util.dev()),
+            cond_text=clip_text_embeds.expand(len(noise), -1, -1),
         )
 
         # Handle case where model outputs both mean and variance
         # Check if model output has twice the channels of input (mean + variance)
-        if model_output.shape[1] == partially_denoised.shape[1] * 2:
+        if model_output.shape[1] == noise.shape[1] * 2:
             # Split model output to get just the mean prediction for x0 computation
-            C = partially_denoised.shape[1]
+            C = noise.shape[1]
             model_output_mean, _ = th.split(model_output, C, dim=1)
         else:
             model_output_mean = model_output
@@ -867,46 +819,57 @@ class LoRAFinetuneLoop:
         # Create output dict for get_pred_x0
         output = {
             "model_output": model_output_mean,
-            "x_t": partially_denoised,
+            "x_t": noise,
         }
         if self.second_stage:
-            ema_model_fn = model_wrapper(
-                self.ema_ddp_model,  # Use DDP model consistently
-                self.noise_schedule,
-                model_type="x_start",
-                model_kwargs={"cond_text": clip_text_embeds},
-            )
+            single_shape = [
+                1,
+                self.model.in_channels,
+                self.model.image_size,
+                self.model.image_size,
+                self.model.image_size,
+            ]
+            ema_noise = th.randn(single_shape, device=dist_util.dev(), dtype=th.float32)
             with th.no_grad():
-                ema_dpm_solver = DPM_Solver(
-                    ema_model_fn,
-                    self.noise_schedule,
-                    algorithm_type="dpmsolver++",
-                    correcting_xt_fn=correcting_xt_fn,
+                ema_model_output = self.ema_ddp_model(
+                    ema_noise,
+                    th.tensor([999], device=dist_util.dev()),
+                    cond_text=clip_text_embeds,
                 )
-                denoised = ema_dpm_solver.sample(
-                    x=noise,
-                    steps=100,
-                    t_start=1.0,
-                    t_end=1.0 / self.diffusion.num_timesteps,
-                    order=2,
-                    skip_type="time_uniform",
-                    method="multistep",
-                )
+
+            # Handle case where model outputs both mean and variance
+            # Check if model output has twice the channels of input (mean + variance)
+            if ema_model_output.shape[1] == noise.shape[1] * 2:
+                # Split model output to get just the mean prediction for x0 computation
+                C = noise.shape[1]
+                ema_model_output_mean, _ = th.split(ema_model_output, C, dim=1)
+            else:
+                ema_model_output_mean = ema_model_output
+
+            # Create output dict for get_pred_x0
+            ema_output = {
+                "model_output": ema_model_output_mean,
+                "x_t": ema_noise,
+            }
         # Get predicted x0 for SDS loss computation
         pose = self.poses[th.randint(0,self.poses.shape[0], (1,))[0]]
         global_orient = pose[:3].view(1, -1)
         body_pose = th.zeros([1, 69], device=dist_util.dev())
         body_pose[0, :63] = pose[3:66]
-        pred_x0 = self.get_pred_x0(output, final_timestep)
+        pred_x0 = self.get_pred_x0(
+            output, th.tensor([999] * len(noise), device=dist_util.dev())
+        )
         pred_x0_denorm = pred_x0 * self.std + self.mean
         self.human_model.update_rest_attributes(pred_x0_denorm[0])
         self.human_model.apply_pose(body_pose=body_pose, global_orient=global_orient)
         pred_x0_denorm = self.human_model.to_x0_denorm()
         if self.second_stage:
-            denoised = denoised * self.std + self.mean
-            self.human_model.update_rest_attributes(denoised[0])
-            denoised_denorm = self.human_model.to_x0_denorm()
-
+            ema_pred_x0 = self.get_pred_x0(
+                ema_output, th.tensor([999], device=dist_util.dev())
+            )
+            ema_pred_x0_denorm = ema_pred_x0 * self.std + self.mean
+            self.human_model.update_rest_attributes(ema_pred_x0_denorm[0])
+            ema_pred_x0_denorm = self.human_model.to_x0_denorm()
         # Compute loss using the predicted x0
         if self.step % self.image_save_interval == 0 and dist.get_rank() == 0:
             s_path = os.path.join(logger.get_dir(), "images")
@@ -923,7 +886,7 @@ class LoRAFinetuneLoop:
             else:
                 loss = self.compute_guided_loss(
                     pred_x0_denorm,
-                    denoised_denorm,
+                    ema_pred_x0_denorm,
                     prompt,
                     save_guidance_path=guidance_path,
                 )
@@ -931,7 +894,9 @@ class LoRAFinetuneLoop:
             if not self.second_stage:
                 loss = self.compute_openpose_guided_loss(pred_x0_denorm, prompt)
             else:
-                loss = self.compute_guided_loss(pred_x0_denorm, denoised_denorm, prompt)
+                loss = self.compute_guided_loss(
+                    pred_x0_denorm, ema_pred_x0_denorm, prompt
+                )
         total_loss = loss["vgg"] + 0.1 * loss["clip"]
 
         # Log losses (skip timestep-based logging since we don't have batch structure)
@@ -945,8 +910,6 @@ class LoRAFinetuneLoop:
             log_dict = {
                 "vgg_loss": loss["vgg"],
                 "clip_loss": loss["clip"],
-                "intermediate_t": intermediate_t,
-                "final_timestep": int(final_timestep[0]),
             }
             self.writer.write_dict(log_dict, self.step)
 

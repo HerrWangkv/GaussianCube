@@ -14,4 +14,4 @@ python finetune_smpl.py \
     --image_save_interval 1 \
     --use_fp16 \
     --use_tensorboard \
-    --resume_checkpoint output/finetune_smpl_0920_0257/checkpoints/step_002000/lora_model002000.pt \
+    --resume_checkpoint output/finetune_smpl_0921_1537/checkpoints/step_005000/lora_model005000.pt \

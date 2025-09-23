@@ -55,7 +55,6 @@ lora:
 
 # Guidance Configuration
 guidance:
-  timestep_range: [0.001, 1.0]
   strength: 0.5
   guidance_scale: 10.0
   vram_O: false                # Memory optimization
