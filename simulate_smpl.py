@@ -196,9 +196,9 @@ def create_humans_batched(objects_info, shared_models, max_batch_size=8):
     std = shared_models["std"]
     model_and_diffusion_config = shared_models["config"]
     image_size = model_and_diffusion_config["model"]["image_size"]
-    human_models = []
     print(f"Creating {len(objects_info)} humans in batches of {max_batch_size}...")
     for i in range(0, len(objects_info), max_batch_size):
+        human_models = []
         batch_info = objects_info[i : i + max_batch_size]
         batch_size = len(batch_info)
         print(f"    Creating batch of {batch_size} objects...")
