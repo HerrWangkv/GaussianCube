@@ -736,8 +736,7 @@ class LoRAFinetuneLoop:
         refined_output = self.refiner.refine_images(
             images=denoised_rendered_views,
             prompt=[prompt + ", " + cam_prompts[i] for i in range(len(cam_prompts))],
-            negative_prompt=["glasses" if "no glasses" in prompt else "no glasses"]
-            * len(cam_prompts),
+            negative_prompt=["glasses"] * len(cam_prompts),
             guidance_scale=self.guidance_scale,
             output_type="pt",
         )
