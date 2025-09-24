@@ -27,7 +27,7 @@ class LPIPS(nn.Module):
         self.lin.load_state_dict(get_state_dict(net_type, version))
 
     def forward(
-        self, x: torch.Tensor, y: torch.Tensor, alpha: float = 0.1
+        self, x: torch.Tensor, y: torch.Tensor, alpha: float = 0.5
     ) -> torch.Tensor:
         """
         x: Tensor of shape (N,3,H,W) or (B,N,3,H,W), values in [-1,1], requires_grad=True
