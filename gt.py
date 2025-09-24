@@ -4,7 +4,7 @@ import numpy as np
 from nuscenes.nuscenes import NuScenes
 import matplotlib.pyplot as plt
 import glob
-import imageio
+import imageio.v2 as imageio
 import argparse
 from PIL import Image
 

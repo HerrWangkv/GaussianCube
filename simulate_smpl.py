@@ -261,6 +261,7 @@ def create_humans_batched(objects_info, shared_models, max_batch_size=8):
                 inversed_assignments=shared_models[
                     "neutral_human_model"
                 ].inversed_assignments,
+                pose_key=obj_info["pose_key"],
                 # initial_gs=parse_volume_data(
                 #     human_models[i].to_x0_denorm(shared_models["neutral_human_model"].inversed_assignments), std_volume, active_sh_degree=0
                 # ),
@@ -271,8 +272,15 @@ def create_humans_batched(objects_info, shared_models, max_batch_size=8):
 
 class Object3D:
     poses = {
-        "stand_to_walk": np.load("smpl/B1 - stand to walk_poses.npz")["poses"][:, :66],
-        "walk": np.load("smpl/B3 - walk1_poses.npz")["poses"][:, :66],
+        "stand_female": np.load("smpl/A1 - Stand_poses.npz")["poses"][
+            :, :66
+        ],  # 0.00 m/s
+        "sway_female": np.load("smpl/A2 - Sway_poses.npz")["poses"][:, :66],  # 0.00 m/s
+        "stand_male": np.load("smpl/A1- Stand_poses.npz")["poses"][:, :66],  # 0.00 m/s
+        "sway_male": np.load("smpl/A2- Sway_poses.npz")["poses"][:, :66],  # 0.00 m/s
+        "walk": np.load("smpl/B3 - walk1_poses.npz")["poses"][:, :66],  # 1.06 m/s
+        "jog": np.load("smpl/C3 - run_poses.npz")["poses"][:, :66],  # 3.62 m/s
+        "run": np.load("smpl/C3 - Run_poses.npz")["poses"][:, :66],  # 4.62 m/s
     }
 
     def __init__(
@@ -308,7 +316,8 @@ class Object3D:
         self._human_model.apply_pose(
             body_pose=initial_pose, global_orient=initial_orient
         )
-        print(f"\tAdd {prompt}")
+        self.scale = None
+        print(f"\t{prompt} initialized with {self._pose_key} pose.")
 
     @property
     def _gs_in_gaussiancube(self):
@@ -321,10 +330,20 @@ class Object3D:
     @property
     def _centeralized_and_scaled_gs_in_gaussiancube(self):
         gs = deepcopy(self._gs_in_gaussiancube)
-        if self._pose_key == "walk":
-            gs = self.rotate_gs(rpy2rotations(0, 0, 3 * np.pi / 4), gs)
-        elif self._pose_key == "stand_to_walk":
+        if self._pose_key in [
+            "stand_to_walk",
+            "stand_female",
+            "stand_male",
+            "sway_female",
+            "sway_male",
+        ]:
             gs = self.rotate_gs(rpy2rotations(0, 0, -np.pi / 2), gs)
+        elif self._pose_key == "walk":
+            gs = self.rotate_gs(rpy2rotations(0, 0, 3 * np.pi / 4), gs)
+        elif self._pose_key == "jog":
+            gs = self.rotate_gs(rpy2rotations(0, 0, -5 * np.pi / 6), gs)
+        elif self._pose_key == "run":
+            gs = self.rotate_gs(rpy2rotations(0, 0, -3 * np.pi / 4), gs)
         valid_mask = gs["opacities"].squeeze() != 0
         x_min, x_max = gs["xyz"][valid_mask, 0].min(), gs["xyz"][valid_mask, 0].max()
         y_min, y_max = gs["xyz"][valid_mask, 1].min(), gs["xyz"][valid_mask, 1].max()
@@ -336,9 +355,10 @@ class Object3D:
             [(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]
         ).cuda()
         gs["xyz"] -= center
-        scale = self._size[2] / (z_max - z_min)
-        gs["xyz"] *= scale
-        gs["scales"] *= scale
+        if self.scale is None:
+            self.scale = self._size[2] / (z_max - z_min)
+        gs["xyz"] *= self.scale
+        gs["scales"] *= self.scale
         return gs
 
     def apply_pose(self, delta_t):
@@ -425,6 +445,8 @@ def all_to_camera_front(nusc, cam_calib_tokens):
     return ret, cam_front_to_ego
 
 def render_gaussian(gaussian, extrinsics, intrinsics, width=533, height=300):
+    if gaussian is None:
+        return torch.ones(1, height, width, 3).cuda()
     extrinsics = torch.tensor(extrinsics).float().cuda()
     intrinsics = torch.tensor(intrinsics).float().cuda()
     intrinsics[0] *= width / 1600
@@ -574,6 +596,7 @@ def main():
     humans_to_create = []
     existing_humans = []
     annotations_2hz = {}
+    positions = {}
     for t in range(scene["nbr_samples"]):
         sample_token = scene["first_sample_token"] if sample is None else sample["next"]
         sample = nusc.get("sample", sample_token)
@@ -606,11 +629,21 @@ def main():
 
             if inst_token not in existing_humans:
                 # Queue for parallel creation
+                prompt = generate_human_prompt()
                 humans_to_create.append(
                     {
                         "inst_token": inst_token,
                         "size": size,
-                        "prompt": generate_human_prompt()
+                        "prompt": prompt,
+                        "pose_key": (
+                            np.random.choice(
+                                ["stand_female", "sway_female"], p=[0.7, 0.3]
+                            )
+                            if "woman" in prompt
+                            else np.random.choice(
+                                ["stand_male", "sway_male"], p=[0.7, 0.3]
+                            )
+                        ),
                     }
                 )
                 existing_humans.append(inst_token)
@@ -621,8 +654,10 @@ def main():
             )
             if inst_token in annotations_2hz:
                 annotations_2hz[inst_token][t] = obj_to_cam_front
+                positions[inst_token][t] = ann["translation"]
             else:
                 annotations_2hz[inst_token] = {t: obj_to_cam_front}
+                positions[inst_token] = {t: ann["translation"]}
     del existing_humans
 
     # Create interpolated annotations with higher frame rate
@@ -632,13 +667,18 @@ def main():
     for inst_token in annotations_2hz:
         annotations_required[inst_token] = {}
         time_keys = sorted(annotations_2hz[inst_token].keys())
+        velocities = []
 
         # For each pair of consecutive keyframes, interpolate
         for i in range(len(time_keys) - 1):
             t1, t2 = time_keys[i], time_keys[i + 1]
             mat1 = annotations_2hz[inst_token][t1]
             mat2 = annotations_2hz[inst_token][t2]
-
+            pos1 = np.array(positions[inst_token][t1])
+            pos2 = np.array(positions[inst_token][t2])
+            velocities.append(
+                np.sum((pos2 - pos1) ** 2) ** 0.5 / (t2 - t1) * 2
+            )  # annotations are at 2hz
             # Add the first keyframe
             for interp_step in range(interpolation_factor):
                 interp_t = t1 * interpolation_factor + interp_step
@@ -665,6 +705,19 @@ def main():
                     annotations_required[inst_token][interp_t] = annotations_2hz[
                         inst_token
                     ][last_t]
+        avg_velocity = sum(velocities) / len(velocities) if velocities else 0
+        if avg_velocity > 4.0:  # running
+            pose_key = "run"
+        elif avg_velocity > 2.0:  # jogging
+            pose_key = "jog"
+        elif avg_velocity > 0.5:  # walking
+            pose_key = "walk"
+        else:
+            continue
+        for obj in humans_to_create:
+            if obj["inst_token"] == inst_token:
+                obj["pose_key"] = pose_key
+                break
 
     created_humans = create_humans_batched(humans_to_create, shared_models)
     # Store created objects and transform them
