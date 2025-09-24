@@ -521,11 +521,12 @@ class SMPL:
             self.vertices, self.faces, device=self.device
         )
 
-    def normalize(self):
+    def normalize(self, ratio=None):
         center = (self.means.max(dim=0).values + self.means.min(dim=0).values) / 2
-        ratio = 1 / torch.max(
-            self.means.max(dim=0).values - self.means.min(dim=0).values + 1e-6
-        )
+        if ratio is None:
+            ratio = 1 / torch.max(
+                self.means.max(dim=0).values - self.means.min(dim=0).values + 1e-6
+            )
         normalized_splats = {
             "means": (self.means - center) * ratio,
             "opacities": self.opacities,
@@ -535,7 +536,7 @@ class SMPL:
             "ratio": ratio,
             "center": center,
         }
-        return normalized_splats
+        return normalized_splats, ratio
 
     def update_rest_attributes(self, colors):
         self.rest_colors = colors
@@ -556,7 +557,8 @@ class SMPLinGaussianCube:
     ):
         self.smpl = SMPL(model_path, device=device, betas=betas)
         self.device = device
-        self.splats = self.smpl.normalize()  # real splats
+        self.splats, _ = self.smpl.normalize()  # real splats
+        self.ratio = None
         self.std_volume = std_volume
         std_volume_offsets = gc_mean[:3, :, :, :].reshape(3, -1).T
         self.M = M = len(self.splats["means"])
@@ -621,7 +623,11 @@ class SMPLinGaussianCube:
         self.smpl.apply_pose(
             body_pose=body_pose, global_orient=global_orient, transl=transl
         )
-        self.splats.update(self.smpl.normalize())
+        if self.ratio is None:
+            splats, self.ratio = self.smpl.normalize()
+        else:
+            splats, _ = self.smpl.normalize(ratio=self.ratio)
+        self.splats.update(splats)
 
     def to_x0_denorm(self, inversed_assignments=None):
         x0_denorm = torch.zeros((self.N, self.num_channels), device=self.device)

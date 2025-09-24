@@ -46,7 +46,6 @@ class LPIPS(nn.Module):
                     .contiguous()
                     .view(B * N, *y.shape[1:])
                 )
-
         feat_x, feat_y = self.net(x), self.net(y)
         # feature difference between generated and reference images
         diff_xy = [(fx - fy) ** 2 for fx, fy in zip(feat_x, feat_y)]
@@ -55,7 +54,7 @@ class LPIPS(nn.Module):
         if len(original_shape) == 4:
             return loss_xy
         # feature difference between generated images
-        diff_xx = [(fx - torch.roll(fx, shifts=1, dims=0)) ** 2 for fx in feat_x]
+        diff_xx = [(fx - torch.roll(fx, shifts=N, dims=0)) ** 2 for fx in feat_x]
         res_xx = [l(d).mean((2, 3), True) for d, l in zip(diff_xx, self.lin)]
         loss_xx = torch.sum(torch.cat(res_xx, 0)) / x.shape[0]
-        return loss_xy - alpha * loss_xx
+        return (1 + alpha) * loss_xy - alpha * loss_xx
